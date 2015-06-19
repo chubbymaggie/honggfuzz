@@ -103,14 +103,16 @@ static void usage(bool exit_success)
            " As above, provide input over STDIN:\n"
            AB "  " PROG_NAME " -f input_dir -- /usr/bin/djpeg\n" AC
 #if defined(_HF_ARCH_LINUX)
-           " Run the binary over over a dynamic file, maximize total no. of instructions:\n"
+           " Run the binary over a dynamic file, maximize total no. of instructions:\n"
            AB "  " PROG_NAME " -Di -- /usr/bin/tiffinfo -D " _HF_FILE_PLACEHOLDER AC "\n"
-           " Run the binary over over a dynamic file, maximize total no. of branches:\n"
+           " Run the binary over a dynamic file, maximize total no. of branches:\n"
            AB "  " PROG_NAME " -Db -- /usr/bin/tiffinfo -D " _HF_FILE_PLACEHOLDER AC "\n"
-           " Run the binary over over a dynamic file, maximize unique code blocks (coverage):\n"
+           " Run the binary over a dynamic file, maximize unique code blocks (coverage):\n"
            AB "  " PROG_NAME " -Dp -- /usr/bin/tiffinfo -D " _HF_FILE_PLACEHOLDER AC "\n"
-           " Run the binary over over a dynamic file, maximize unique branches (edges):\n"
-           AB "  " PROG_NAME " -Dp -- /usr/bin/tiffinfo -D " _HF_FILE_PLACEHOLDER AC "\n"
+           " Run the binary over a dynamic file, maximize unique branches (edges):\n"
+           AB "  " PROG_NAME " -De -- /usr/bin/tiffinfo -D " _HF_FILE_PLACEHOLDER AC "\n"
+           " Run the binary over a dynamic file, maximize custom counters (experimental):\n"
+           AB "  " PROG_NAME " -Df -- /usr/bin/tiffinfo -D " _HF_FILE_PLACEHOLDER AC "\n"
 #endif /* defined(_HF_ARCH_LINUX) */
           );
     /*  *INDENT-ON* */
