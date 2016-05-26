@@ -35,6 +35,7 @@
 #include <string.h>
 #include <sys/cdefs.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -42,9 +43,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "log.h"
-#include "util.h"
 #include "files.h"
+#include "log.h"
+#include "sancov.h"
+#include "subproc.h"
+#include "util.h"
 
 #include <servers/bootstrap.h>
 #include <mach/mach.h>
@@ -88,6 +91,12 @@ static mach_port_t g_exception_port = MACH_PORT_NULL;
  * Global to store crash info in exception handler thread
  */
 fuzzer_t g_fuzzer_crash_information[PID_MAX + 1];
+
+/*
+ * Global to store the CrashWrangler generated callstack from
+ * the exception handler thread
+ */
+static char *g_fuzzer_crash_callstack[PID_MAX + 1];
 
 /*
  * Global to have a unique service name for each honggfuzz process
@@ -144,6 +153,33 @@ const char *exception_to_string(int exception)
     return "UNKNOWN";
 }
 
+static void arch_generateReport(fuzzer_t * fuzzer, int termsig)
+{
+    fuzzer->report[0] = '\0';
+    util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "ORIG_FNAME: %s\n",
+                   fuzzer->origFileName);
+    util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "FUZZ_FNAME: %s\n",
+                   fuzzer->crashFileName);
+    util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "PID: %d\n", fuzzer->pid);
+    util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "SIGNAL: %s (%d)\n",
+                   arch_sigs[termsig].descr, termsig);
+    util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "EXCEPTION: %s\n",
+                   exception_to_string(fuzzer->exception));
+    util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "FAULT ADDRESS: %p\n", fuzzer->access);
+    util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "CRASH FRAME PC: %p\n", fuzzer->pc);
+    util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "STACK HASH: %016llx\n",
+                   fuzzer->backtrace);
+    if (g_fuzzer_crash_callstack[fuzzer->pid]) {
+        util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "STACK: \n%s\n",
+                       g_fuzzer_crash_callstack[fuzzer->pid]);
+    } else {
+        util_ssnprintf(fuzzer->report, sizeof(fuzzer->report),
+                       "STACK: \n Callstack not available.\n");
+    }
+
+    return;
+}
+
 /*
  * Returns true if a process exited (so, presumably, we can delete an input
  * file)
@@ -157,12 +193,15 @@ static bool arch_analyzeSignal(honggfuzz_t * hfuzz, int status, fuzzer_t * fuzze
         return false;
     }
 
+    if (WIFEXITED(status) || WIFSIGNALED(status)) {
+        sancov_Analyze(hfuzz, fuzzer);
+    }
+
     /*
      * Boring, the process just exited
      */
     if (WIFEXITED(status)) {
-        LOGMSG(l_DEBUG, "Process (pid %d) exited normally with status %d", fuzzer->pid,
-               WEXITSTATUS(status));
+        LOG_D("Process (pid %d) exited normally with status %d", fuzzer->pid, WEXITSTATUS(status));
         return true;
     }
 
@@ -170,24 +209,25 @@ static bool arch_analyzeSignal(honggfuzz_t * hfuzz, int status, fuzzer_t * fuzze
      * Shouldn't really happen, but, well..
      */
     if (!WIFSIGNALED(status)) {
-        LOGMSG(l_ERROR,
-               "Process (pid %d) exited with the following status %d, please report that as a bug",
-               fuzzer->pid, status);
+        LOG_E("Process (pid %d) exited with the following status %d, please report that as a bug",
+              fuzzer->pid, status);
         return true;
     }
 
     int termsig = WTERMSIG(status);
-    LOGMSG(l_DEBUG, "Process (pid %d) killed by signal %d '%s'", fuzzer->pid, termsig,
-           strsignal(termsig));
+    LOG_D("Process (pid %d) killed by signal %d '%s'", fuzzer->pid, termsig, strsignal(termsig));
     if (!arch_sigs[termsig].important) {
-        LOGMSG(l_DEBUG, "It's not that important signal, skipping");
+        LOG_D("It's not that important signal, skipping");
         return true;
     }
 
     /*
      * Signal is interesting
      */
-    char newname[PATH_MAX];
+    /*
+     * Increase crashes counter presented by ASCII display
+     */
+    ATOMIC_POST_INC(hfuzz->crashesCnt);
 
     /*
      * Get data from exception handler
@@ -197,48 +237,89 @@ static bool arch_analyzeSignal(honggfuzz_t * hfuzz, int status, fuzzer_t * fuzze
     fuzzer->access = g_fuzzer_crash_information[fuzzer->pid].access;
     fuzzer->backtrace = g_fuzzer_crash_information[fuzzer->pid].backtrace;
 
-    if (hfuzz->saveUnique) {
-        snprintf(newname, sizeof(newname),
-                 "%s.%s.PC.%.16llx.STACK.%.16llx.ADDR.%.16llx.%s.%s",
-                 arch_sigs[termsig].descr,
-                 exception_to_string(fuzzer->exception), fuzzer->pc,
-                 fuzzer->backtrace, fuzzer->access, fuzzer->origFileName, hfuzz->fileExtn);
-    } else {
-
-        char localtmstr[PATH_MAX];
-        util_getLocalTime("%F.%H.%M.%S", localtmstr, sizeof(localtmstr));
-
-        snprintf(newname, sizeof(newname),
-                 "%s.%s.PC.%.16llx.STACK.%.16llx.ADDR.%.16llx.TIME.%s.PID.%.5d.%s.%s",
-                 arch_sigs[termsig].descr,
-                 exception_to_string(fuzzer->exception), fuzzer->pc,
-                 fuzzer->backtrace, fuzzer->access, localtmstr, fuzzer->pid, fuzzer->origFileName,
-                 hfuzz->fileExtn);
-    }
-
-    if (link(fuzzer->fileName, newname) == 0) {
-        LOGMSG(l_INFO, "Ok, that's interesting, saved '%s' as '%s'", fuzzer->fileName, newname);
-    } else {
-        if (errno == EEXIST) {
-            LOGMSG(l_INFO, "It seems that '%s' already exists, skipping", newname);
-        } else {
-            LOGMSG_P(l_ERROR, "Couldn't link '%s' to '%s'", fuzzer->fileName, newname);
+    defer {
+        if (g_fuzzer_crash_callstack[fuzzer->pid]) {
+            free(g_fuzzer_crash_callstack[fuzzer->pid]);
+            g_fuzzer_crash_callstack[fuzzer->pid] = NULL;
         }
+    };
+
+    /*
+     * Check if stackhash is blacklisted
+     */
+    if (hfuzz->blacklist
+        && (fastArray64Search(hfuzz->blacklist, hfuzz->blacklistCnt, fuzzer->backtrace) != -1)) {
+        LOG_I("Blacklisted stack hash '%" PRIx64 "', skipping", fuzzer->backtrace);
+        ATOMIC_POST_INC(hfuzz->blCrashesCnt);
+        return true;
     }
+
+    /* If dry run mode, copy file with same name into workspace */
+    if (hfuzz->origFlipRate == 0.0L && hfuzz->useVerifier) {
+        snprintf(fuzzer->crashFileName, sizeof(fuzzer->crashFileName), "%s/%s",
+                 hfuzz->workDir, fuzzer->origFileName);
+    } else if (hfuzz->saveUnique) {
+        snprintf(fuzzer->crashFileName, sizeof(fuzzer->crashFileName),
+                 "%s/%s.%s.PC.%.16llx.STACK.%.16llx.ADDR.%.16llx.%s",
+                 hfuzz->workDir, arch_sigs[termsig].descr,
+                 exception_to_string(fuzzer->exception), fuzzer->pc,
+                 fuzzer->backtrace, fuzzer->access, hfuzz->fileExtn);
+    } else {
+        char localtmstr[PATH_MAX];
+        util_getLocalTime("%F.%H.%M.%S", localtmstr, sizeof(localtmstr), time(NULL));
+
+        snprintf(fuzzer->crashFileName, sizeof(fuzzer->crashFileName),
+                 "%s/%s.%s.PC.%.16llx.STACK.%.16llx.ADDR.%.16llx.TIME.%s.PID.%.5d.%s",
+                 hfuzz->workDir, arch_sigs[termsig].descr,
+                 exception_to_string(fuzzer->exception), fuzzer->pc,
+                 fuzzer->backtrace, fuzzer->access, localtmstr, fuzzer->pid, hfuzz->fileExtn);
+    }
+
+    if (files_exists(fuzzer->crashFileName)) {
+        LOG_I("It seems that '%s' already exists, skipping", fuzzer->crashFileName);
+        // Clear filename so that verifier can understand we hit a duplicate
+        memset(fuzzer->crashFileName, 0, sizeof(fuzzer->crashFileName));
+        return true;
+    }
+
+    if (files_writeBufToFile
+        (fuzzer->crashFileName, fuzzer->dynamicFile, fuzzer->dynamicFileSz,
+         O_CREAT | O_EXCL | O_WRONLY) == false) {
+        LOG_E("Couldn't copy '%s' to '%s'", fuzzer->fileName, fuzzer->crashFileName);
+        return true;
+    }
+
+    LOG_I("Ok, that's interesting, saved '%s' as '%s'", fuzzer->fileName, fuzzer->crashFileName);
+
+    ATOMIC_POST_INC(hfuzz->uniqueCrashesCnt);
+    /* If unique crash found, reset dynFile counter */
+    ATOMIC_CLEAR(hfuzz->dynFileIterExpire);
+
+    arch_generateReport(fuzzer, termsig);
 
     return true;
+}
+
+pid_t arch_fork(honggfuzz_t * hfuzz UNUSED, fuzzer_t * fuzzer UNUSED)
+{
+    return fork();
 }
 
 bool arch_launchChild(honggfuzz_t * hfuzz, char *fileName)
 {
 #define ARGS_MAX 512
     char *args[ARGS_MAX + 2];
-
+    char argData[PATH_MAX] = { 0 };
     int x;
 
     for (x = 0; x < ARGS_MAX && hfuzz->cmdline[x]; x++) {
         if (!hfuzz->fuzzStdin && strcmp(hfuzz->cmdline[x], _HF_FILE_PLACEHOLDER) == 0) {
             args[x] = fileName;
+        } else if (!hfuzz->fuzzStdin && strstr(hfuzz->cmdline[x], _HF_FILE_PLACEHOLDER)) {
+            const char *off = strstr(hfuzz->cmdline[x], _HF_FILE_PLACEHOLDER);
+            snprintf(argData, PATH_MAX, "%.*s%s", (int)(off - hfuzz->cmdline[x]), hfuzz->cmdline[x],
+                     fileName);
+            args[x] = argData;
         } else {
             args[x] = hfuzz->cmdline[x];
         }
@@ -246,7 +327,7 @@ bool arch_launchChild(honggfuzz_t * hfuzz, char *fileName)
 
     args[x++] = NULL;
 
-    LOGMSG(l_DEBUG, "Launching '%s' on file '%s'", args[0], fileName);
+    LOG_D("Launching '%s' on file '%s'", args[0], fileName);
 
     /*
      * Get child's bootstrap port.
@@ -277,87 +358,7 @@ bool arch_launchChild(honggfuzz_t * hfuzz, char *fileName)
         return false;
     }
 
-    /*
-     * Set timeout (prof), real timeout (2*prof), and rlimit_cpu (2*prof)
-     */
-    if (hfuzz->tmOut) {
-        struct itimerval it;
-
-        /*
-         * The hfuzz->tmOut is real CPU usage time...
-         */
-        it.it_value.tv_sec = hfuzz->tmOut;
-        it.it_value.tv_usec = 0;
-        it.it_interval.tv_sec = 0;
-        it.it_interval.tv_usec = 0;
-        if (setitimer(ITIMER_PROF, &it, NULL) == -1) {
-            LOGMSG_P(l_ERROR, "Couldn't set the ITIMER_PROF timer");
-            return false;
-        }
-
-        /*
-         * ...so, if a process sleeps, this one should
-         * trigger a signal...
-         */
-        it.it_value.tv_sec = hfuzz->tmOut;
-        it.it_value.tv_usec = 0;
-        it.it_interval.tv_sec = 0;
-        it.it_interval.tv_usec = 0;
-        if (setitimer(ITIMER_REAL, &it, NULL) == -1) {
-            LOGMSG_P(l_ERROR, "Couldn't set the ITIMER_REAL timer");
-            return false;
-        }
-
-        /*
-         * ..if a process sleeps and catches SIGPROF/SIGALRM
-         * rlimits won't help either. However, arch_checkTimeLimit
-         * will send a SIGKILL at tmOut + 2 seconds. That should
-         * do it :)
-         */
-        struct rlimit rl;
-
-        rl.rlim_cur = hfuzz->tmOut + 1;
-        rl.rlim_max = hfuzz->tmOut + 1;
-        if (setrlimit(RLIMIT_CPU, &rl) == -1) {
-            LOGMSG_P(l_ERROR, "Couldn't enforce the RLIMIT_CPU resource limit");
-            return false;
-        }
-    }
-
-    /*
-     * The address space limit. If big enough - roughly the size of RAM used
-     */
-    if (hfuzz->asLimit) {
-        struct rlimit rl;
-
-        rl.rlim_cur = hfuzz->asLimit * 1024UL * 1024UL;
-        rl.rlim_max = hfuzz->asLimit * 1024UL * 1024UL;
-        if (setrlimit(RLIMIT_AS, &rl) == -1) {
-            LOGMSG_P(l_DEBUG, "Couldn't encforce the RLIMIT_AS resource limit, ignoring");
-        }
-    }
-
-    if (hfuzz->nullifyStdio) {
-        util_nullifyStdio();
-    }
-
-    if (hfuzz->fuzzStdin) {
-        /*
-         * Uglyyyyyy ;)
-         */
-        if (!util_redirectStdin(fileName)) {
-            return false;
-        }
-    }
-
-    for (size_t i = 0; i < ARRAYSIZE(hfuzz->envs) && hfuzz->envs[i]; i++) {
-        putenv(hfuzz->envs[i]);
-    }
-
     execvp(args[0], args);
-
-    util_recoverStdio();
-    LOGMSG(l_FATAL, "Failed to create new '%s' process", args[0]);
     return false;
 }
 
@@ -369,8 +370,8 @@ static void arch_checkTimeLimit(honggfuzz_t * hfuzz, fuzzer_t * fuzzer)
     int64_t curMillis = util_timeNowMillis();
     int64_t diffMillis = curMillis - fuzzer->timeStartedMillis;
     if (diffMillis > ((hfuzz->tmOut + 2) * 1000)) {
-        LOGMSG(l_WARN, "PID %d took too much time (limit %ld s). Sending SIGKILL",
-               fuzzer->pid, hfuzz->tmOut);
+        LOG_W("PID %d took too much time (limit %ld s). Sending SIGKILL",
+              fuzzer->pid, hfuzz->tmOut);
         kill(fuzzer->pid, SIGKILL);
     }
 }
@@ -378,7 +379,7 @@ static void arch_checkTimeLimit(honggfuzz_t * hfuzz, fuzzer_t * fuzzer)
 void arch_reapChild(honggfuzz_t * hfuzz, fuzzer_t * fuzzer)
 {
     /*
-     * First check manually if we have expired childs
+     * First check manually if we have expired children
      */
     arch_checkTimeLimit(hfuzz, fuzzer);
 
@@ -398,7 +399,10 @@ void arch_reapChild(honggfuzz_t * hfuzz, fuzzer_t * fuzzer)
                 usleep(0.20 * 1000000);
             }
         }
-        LOGMSG(l_DEBUG, "Process (pid %d) came back with status %d", fuzzer->pid, status);
+
+        char strStatus[4096];
+        LOG_D("Process (pid %d) came back with status: %s", fuzzer->pid,
+              subproc_StatusToStr(status, strStatus, sizeof(strStatus)));
 
         if (arch_analyzeSignal(hfuzz, status, fuzzer)) {
             return;
@@ -423,8 +427,8 @@ bool arch_archInit(honggfuzz_t * hfuzz)
              getlogin());
 
     if (files_exists(plist)) {
-        LOGMSG(l_WARN,
-               "honggfuzz won't work if DBGShellCommands are set in ~/Library/Preferences/com.apple.DebugSymbols.plist");
+        LOG_W
+            ("honggfuzz won't work if DBGShellCommands are set in ~/Library/Preferences/com.apple.DebugSymbols.plist");
     }
 
     /*
@@ -468,22 +472,23 @@ bool arch_archInit(honggfuzz_t * hfuzz)
     pthread_t exception_thread;
 
     if (pthread_create(&exception_thread, NULL, wait_for_exception, 0)) {
-        LOGMSG(l_FATAL, "Parent: could not create thread to wait for child's exception");
+        LOG_F("Parent: could not create thread to wait for child's exception");
         return false;
     }
 
     if (pthread_detach(exception_thread)) {
-        LOGMSG(l_FATAL, "Parent: could not detach thread to wait for child's exception");
+        LOG_F("Parent: could not detach thread to wait for child's exception");
         return false;
     }
 
     return true;
 }
 
+#ifdef DEBUG
 /*
  * Write the crash report to DEBUG
  */
-void
+static void
 write_crash_report(thread_port_t thread,
                    task_port_t task,
                    exception_type_t exception,
@@ -509,21 +514,24 @@ write_crash_report(thread_port_t thread,
     NSString *crashDescription =[_crashReport description];
     char *description = (char *)[crashDescription UTF8String];
 
-    LOGMSG(l_DEBUG, "CrashReport: %s", description);
+    LOG_D("CrashReport: %s", description);
 
     [_crashReport release];
     [pool drain];
 }
+#endif
 
 /* Hash the callstack in an unique way */
-uint64_t hash_callstack(thread_port_t thread,
-                        task_port_t task,
-                        exception_type_t exception,
-                        mach_exception_data_t code,
-                        mach_msg_type_number_t code_count,
-                        int *flavor,
-                        thread_state_t in_state,
-                        mach_msg_type_number_t in_state_count) {
+static uint64_t
+hash_callstack(thread_port_t thread,
+               task_port_t task,
+               exception_type_t exception,
+               mach_exception_data_t code,
+               mach_msg_type_number_t code_count,
+               int *flavor,
+               thread_state_t in_state,
+               mach_msg_type_number_t in_state_count)
+{
 
     NSAutoreleasePool *pool =[[NSAutoreleasePool alloc] init];
     CrashReport *_crashReport = nil;
@@ -548,7 +556,7 @@ uint64_t hash_callstack(thread_port_t thread,
     char *callstack = strstr(description, "Crashed:");
 
     if (callstack == NULL) {
-        LOGMSG(l_FATAL, "Could not find callstack in crash report %s", description);
+        LOG_F("Could not find callstack in crash report %s", description);
     }
 
     /*
@@ -557,7 +565,7 @@ uint64_t hash_callstack(thread_port_t thread,
     char *callstack_start = strstr(callstack, "\n");
 
     if (callstack_start == NULL) {
-        LOGMSG(l_FATAL, "Could not find callstack start in crash report %s", description);
+        LOG_F("Could not find callstack start in crash report %s", description);
     }
 
     /*
@@ -568,49 +576,82 @@ uint64_t hash_callstack(thread_port_t thread,
     /*
      * Determine the end of the callstack
      */
-    char *callstack_end = strstr(callstack, "\n\nThread");
+    char *callstack_end = strstr(callstack_start, "\n\nThread");
 
     if (callstack_end == NULL) {
-        LOGMSG(l_FATAL, "Could not find callstack end in crash report %s", description);
+        LOG_F("Could not find callstack end in crash report %s", description);
+    }
+
+    if (callstack_end <= callstack_start) {
+        LOG_F("Malformed callstack: %s", description);
     }
 
     /*
-     * Make sure it's NULL-terminated
+     * Check for too large callstack.
+     */
+#define MAX_CALLSTACK_SIZE 4096
+    const size_t callstack_size = (callstack_end - callstack_start);
+    if (callstack_size > MAX_CALLSTACK_SIZE) {
+        LOG_W("Too large callstack (%zu bytes), truncating to %d bytes",
+              callstack_size, MAX_CALLSTACK_SIZE);
+        callstack_start[MAX_CALLSTACK_SIZE] = '\0';
+        callstack_end = callstack_start + MAX_CALLSTACK_SIZE;
+    }
+
+    pid_t pid;
+    pid_for_task(task, &pid);
+
+    char **buf = &g_fuzzer_crash_callstack[pid];
+    /*
+     * Check for memory leaks. This shouldn't happen.
+     */
+    if (*buf) {
+        LOG_E("Memory leak: arch_analyzeSignal didn't free previous callstack");
+        free(*buf);
+        *buf = NULL;
+    }
+
+    /*
+     * Copy the CrashWrangler formatted callstack and make sure
+     * it's NULL-terminated.
      */
     *callstack_end = '\0';
+    *buf = util_StrDup(callstack_start);
 
     /*
      *
      * For each line, we only take the last three nibbles from the
      * address.
      *
-     * Sample output:
+     * Sample outputs:
      *
-     * 0 libsystem_kernel.dylib 0x00007fff80514d46 __kill + 10 1
-     * libsystem_c.dylib 0x00007fff85731ec0 __abort + 193 2
-     * libsystem_c.dylib 0x00007fff85732d17 __stack_chk_fail + 195 3
-     * stack_buffer_overflow64-stripped 0x000000010339def5 0x10339d000 +
-     * 3829 4 ??? 0x4141414141414141 0 + 4702111234474983745
+     * 0 libsystem_kernel.dylib 0x00007fff80514d46 __kill + 10
+     * 1 libsystem_c.dylib 0x00007fff85731ec0 __abort + 193
+     * 2 libsystem_c.dylib 0x00007fff85732d17 __stack_chk_fail + 195
+     * 3 stack_buffer_overflow64-stripped 0x000000010339def5 0x10339d000 + 3829
+     * 4 ??? 0x4141414141414141 0 + 4702111234474983745
      *
-     * 0 libsystem_kernel.dylib 0x00007fff80514d46 __kill + 10 1
-     * libsystem_c.dylib 0x00007fff85731ec0 __abort + 193 2
-     * libsystem_c.dylib 0x00007fff85732d17 __stack_chk_fail + 195 3
-     * stack_buffer_overflow64 0x0000000108f41ef5 main + 133 4 ???
-     * 0x4141414141414141 0 + 4702111234474983745
+     * 0 libsystem_kernel.dylib 0x00007fff80514d46 __kill + 10
+     * 1 libsystem_c.dylib 0x00007fff85731ec0 __abort + 193
+     * 2 libsystem_c.dylib 0x00007fff85732d17 __stack_chk_fail + 195
+     * 3 stack_buffer_overflow64 0x0000000108f41ef5 main + 133
+     * 4 ??? 0x4141414141414141 0 + 4702111234474983745
      *
-     * 0 libsystem_kernel.dylib 0x940023ba __kill + 10 1
-     * libsystem_kernel.dylib 0x940014bc kill$UNIX2003 + 32 2
-     * libsystem_c.dylib 0x926f362e __abort + 246 3 libsystem_c.dylib
-     * 0x926c2b60 __chk_fail + 49 4 libsystem_c.dylib 0x926c2bf9
-     * __memset_chk + 53 5 stack_buffer_overflow32-stripped 0x00093ee5
-     * 0x93000 + 3813 6 libdyld.dylib 0x978c6725 start + 1
+     * 0 libsystem_kernel.dylib 0x940023ba __kill + 10
+     * 1 libsystem_kernel.dylib 0x940014bc kill$UNIX2003 + 32
+     * 2 libsystem_c.dylib 0x926f362e __abort + 246
+     * 3 libsystem_c.dylib 0x926c2b60 __chk_fail + 49
+     * 4 libsystem_c.dylib 0x926c2bf9 __memset_chk + 53
+     * 5 stack_buffer_overflow32-stripped 0x00093ee5 0x93000 + 3813
+     * 6 libdyld.dylib 0x978c6725 start + 1
      *
-     * 0 libsystem_kernel.dylib 0x940023ba __kill + 10 1
-     * libsystem_kernel.dylib 0x940014bc kill$UNIX2003 + 32 2
-     * libsystem_c.dylib 0x926f362e __abort + 246 3 libsystem_c.dylib
-     * 0x926c2b60 __chk_fail + 49 4 libsystem_c.dylib 0x926c2bf9
-     * __memset_chk + 53 5 stack_buffer_overflow32 0x0003cee5 main + 117 6
-     * libdyld.dylib 0x978c6725 start + 1
+     * 0 libsystem_kernel.dylib 0x940023ba __kill + 10
+     * 1 libsystem_kernel.dylib 0x940014bc kill$UNIX2003 + 32
+     * 2 libsystem_c.dylib 0x926f362e __abort + 246
+     * 3 libsystem_c.dylib 0x926c2b60 __chk_fail + 49
+     * 4 libsystem_c.dylib 0x926c2bf9 __memset_chk + 53
+     * 5 stack_buffer_overflow32 0x0003cee5 main + 117
+     * 6 libdyld.dylib 0x978c6725 start + 1
      *
      */
 
@@ -640,7 +681,7 @@ uint64_t hash_callstack(thread_port_t thread,
         pos++;
     }
 
-    LOGMSG(l_DEBUG, "Callstack hash %u", hash);
+    LOG_D("Callstack hash %llu", hash);
 
     [_crashReport release];
     [pool drain];
@@ -655,7 +696,7 @@ catch_mach_exception_raise(mach_port_t exception_port,
                            exception_type_t exception, mach_exception_data_t code,
                            mach_msg_type_number_t codeCnt)
 {
-    LOGMSG(l_FATAL, "This function should never get called");
+    LOG_F("This function should never get called");
     return KERN_SUCCESS;
 }
 
@@ -669,7 +710,7 @@ catch_mach_exception_raise_state(mach_port_t exception_port,
                                  mach_msg_type_number_t old_stateCnt,
                                  thread_state_t new_state, mach_msg_type_number_t * new_stateCnt)
 {
-    LOGMSG(l_FATAL, "This function should never get called");
+    LOG_F("This function should never get called");
     return KERN_SUCCESS;
 }
 
@@ -688,7 +729,7 @@ kern_return_t catch_mach_exception_raise_state_identity( __attribute__ ((unused)
                                                         mach_msg_type_number_t * out_state_count)
 {
     if (exception != EXC_CRASH) {
-        LOGMSG(l_FATAL, "Got non EXC_CRASH! This should not happen.");
+        LOG_F("Got non EXC_CRASH! This should not happen.");
     }
 
     /*
@@ -696,7 +737,7 @@ kern_return_t catch_mach_exception_raise_state_identity( __attribute__ ((unused)
      */
     pid_t pid;
     pid_for_task(task, &pid);
-    LOGMSG(l_DEBUG, "Crash of pid %d", pid);
+    LOG_D("Crash of pid %d", pid);
 
     fuzzer_t *fuzzer = &g_fuzzer_crash_information[pid];
 
@@ -704,7 +745,6 @@ kern_return_t catch_mach_exception_raise_state_identity( __attribute__ ((unused)
      * Get program counter.
      * Cast to void* in order to silence the alignment warnings
      */
-
     x86_thread_state_t *platform_in_state = ((x86_thread_state_t *) (void *)in_state);
 
     if (x86_THREAD_STATE32 == platform_in_state->tsh.flavor) {
@@ -716,19 +756,15 @@ kern_return_t catch_mach_exception_raise_state_identity( __attribute__ ((unused)
     /*
      * Get the exception type
      */
-
     exception_type_t exception_type = ((code[0] >> 20) & 0x0F);
-
     if (exception_type == 0) {
         exception_type = EXC_CRASH;
     }
-
     fuzzer->exception = exception_type;
 
     /*
      * Get the access address.
      */
-
     mach_exception_data_type_t exception_data[2];
     memcpy(exception_data, code, sizeof(exception_data));
     exception_data[0] = (code[0] & ~(0x00000000FFF00000));
@@ -740,25 +776,33 @@ kern_return_t catch_mach_exception_raise_state_identity( __attribute__ ((unused)
     /*
      * Get a hash of the callstack
      */
-
     uint64_t hash = hash_callstack(thread, task, exception, code, code_count, flavor,
                                    in_state, in_state_count);
-
     fuzzer->backtrace = hash;
+
+#ifdef DEBUG
+    write_crash_report(thread, task, exception, code, code_count, flavor, in_state, in_state_count);
+#endif
 
     /*
      * Cleanup
      */
-
     if (mach_port_deallocate(mach_task_self(), task) != KERN_SUCCESS) {
-        LOGMSG(l_WARN, "Exception Handler: Could not deallocate task");
+        LOG_W("Exception Handler: Could not deallocate task");
     }
 
     if (mach_port_deallocate(mach_task_self(), thread) != KERN_SUCCESS) {
-        LOGMSG(l_WARN, "Exception Handler: Could not deallocate thread");
+        LOG_W("Exception Handler: Could not deallocate thread");
     }
 
-    return KERN_SUCCESS;        // KERN_SUCCESS indicates that this should
-    // not be forwarded to other crash
-    // handlers
+    /*
+     * KERN_SUCCESS indicates that this should not be forwarded to other crash
+     * handlers
+     */
+    return KERN_SUCCESS;
+}
+
+bool arch_archThreadInit(honggfuzz_t * hfuzz UNUSED, fuzzer_t * fuzzer UNUSED)
+{
+    return true;
 }

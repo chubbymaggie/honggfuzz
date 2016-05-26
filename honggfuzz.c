@@ -23,7 +23,9 @@
  *
  */
 
+#include <inttypes.h>
 #include <getopt.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,304 +33,168 @@
 #include <unistd.h>
 
 #include "common.h"
+#include "cmdline.h"
+#include "display.h"
 #include "log.h"
 #include "files.h"
 #include "fuzz.h"
 #include "util.h"
 
-#define AB ANSI_BOLD
-#define AC ANSI_CLEAR
-#define ANSI_BOLD "\033[1m"
-#define ANSI_CLEAR "\033[0m"
+static int sigReceived = 0;
 
-static bool checkFor_FILE_PLACEHOLDER(char **args)
+/*
+ * CygWin/MinGW incorrectly copies stack during fork(), so we need to keep some
+ * structures in the data section
+ */
+honggfuzz_t hfuzz;
+
+void sigHandler(int sig)
 {
-    for (int x = 0; args[x]; x++) {
-        if (!strcmp(args[x], _HF_FILE_PLACEHOLDER))
-            return true;
+    /* We should not terminate upon SIGALRM delivery */
+    if (sig == SIGALRM) {
+        return;
     }
-    return false;
+
+    sigReceived = sig;
 }
 
-static void usage(bool exit_success)
+static void setupTimer(void)
 {
-    /*  *INDENT-OFF* */
-    printf(AB PROG_NAME " version " PROG_VERSION " by " PROG_AUTHORS AC "\n");
-    printf("%s",
-           " [" AB "-f val" AC "] : input file corpus directory\n"
-           "            (or a path to a single input file)\n"
-           " [" AB "-h" AC "]     : this help\n"
-           " [" AB "-q" AC "]     : null-ify children's stdin, stdout, stderr; make them quiet\n"
-           "            (default: " AB "false" AC ")\n"
-           " [" AB "-s" AC "]     : provide fuzzing input on STDIN, instead of a file argument\n"
-           "            (default: " AB "false" AC ")\n"
-           " [" AB "-u" AC "]     : save unique test-cases only, otherwise (if not used) append\n"
-           "            current timestamp to the output filenames (default: " AB "false" AC ")\n"
-           " [" AB "-d val" AC "] : debug level (0 - FATAL ... 4 - DEBUG), (default: '" AB "3" AC
-           "' [INFO])\n"
-           " [" AB "-e val" AC "] : file extension (e.g. 'swf'), (default: '" AB "fuzz" AC "')\n"
-           " [" AB "-r val" AC "] : flip rate, (default: '" AB "0.001" AC "')\n"
-           " [" AB "-w val" AC "] : wordlist, (default: empty) [tokens delimited by NUL-bytes]\n"
-           " [" AB "-c val" AC "] : external command modifying the input corpus of files,\n"
-           "            instead of -r/-m (default: " AB "none" AC ")\n"
-           " [" AB "-t val" AC "] : timeout (in secs), (default: '" AB "3" AC "' [0 - no timeout])\n"
-           " [" AB "-a val" AC "] : address limit (from si.si_addr) below which crashes\n"
-           "            are not reported, (default: '" AB "0" AC "' [suggested: 65535])\n"
-           " [" AB "-n val" AC "] : number of concurrent fuzzing threads, (default: '" AB "2" AC "')\n"
-           " [" AB "-N val" AC "] : number of fuzzing mutations, (default: '" AB "0" AC "' [infinte])\n"
-           " [" AB "-l val" AC "] : per process memory limit in MiB, (default: '" AB "0" AC "' [no limit])\n"
-           " [" AB "-R val" AC "] : write report to this file, (default: '" AB _HF_REPORT_FILE AC "')\n"
-           " [" AB "-F val" AC "] : Maximal size of files created by the fuzzer (default '" AB "1048576" AC "')\n"
-           " [" AB "-E val" AC "] : Pass this environment variable (default '" AB "empty" AC "')\n"
-           "            can be used multiple times\n"
-#if defined(_HF_ARCH_LINUX)
-           " [" AB "-p val" AC "] : [Linux] attach to a pid (and its thread group), instead of \n"
-           "            monitoring a previously created process, (default: '" AB "0" AC "' [none])\n"
-           " [" AB "-g val" AC "] : [Linux] allow that many regressions (perf events) wrt the best one\n"
-           " [" AB "-o val" AC "] : [Linux] cut-off address, don't record branches above that address\n"
-           " [" AB "-D val" AC "] : [Linux] create a file dynamically with Linux perf counters,\n"
-           "            can be used with or without the '-f' flag (initial file contents)\n"
-           "            (default: " AB "none" AC ")\n"
-           "            Available counters: \n"
-           "               " AB "'i' " AC "- PERF_COUNT_HW_INSTRUCTIONS (total IPs)\n"
-           "               " AB "'b' " AC "- PERF_COUNT_HW_BRANCH_INSTRUCTIONS (total jumps/calls)\n"
-           "               " AB "'p' " AC "- PERF_SAMPLE_IP (unique code blocks)\n"
-           "                     (newer Intel CPUs only)\n"
-           "               " AB "'e' " AC "- PERF_SAMPLE_IP/PERF_SAMPLE_ADDR (unique branch edges)\n"
-           "                     (newer Intel CPUs only)\n"
-#endif /* defined(_HF_ARCH_LINUX) */
-           "\nExamples:\n"
-           " Run the binary over a mutated file chosen from the directory:\n"
-           AB "  " PROG_NAME " -f input_dir -- /usr/bin/tiffinfo -D " _HF_FILE_PLACEHOLDER AC "\n"
-           " As above, provide input over STDIN:\n"
-           AB "  " PROG_NAME " -f input_dir -- /usr/bin/djpeg\n" AC
-#if defined(_HF_ARCH_LINUX)
-           " Run the binary over a dynamic file, maximize total no. of instructions:\n"
-           AB "  " PROG_NAME " -Di -- /usr/bin/tiffinfo -D " _HF_FILE_PLACEHOLDER AC "\n"
-           " Run the binary over a dynamic file, maximize total no. of branches:\n"
-           AB "  " PROG_NAME " -Db -- /usr/bin/tiffinfo -D " _HF_FILE_PLACEHOLDER AC "\n"
-           " Run the binary over a dynamic file, maximize unique code blocks (coverage):\n"
-           AB "  " PROG_NAME " -Dp -- /usr/bin/tiffinfo -D " _HF_FILE_PLACEHOLDER AC "\n"
-           " Run the binary over a dynamic file, maximize unique branches (edges):\n"
-           AB "  " PROG_NAME " -De -- /usr/bin/tiffinfo -D " _HF_FILE_PLACEHOLDER AC "\n"
-           " Run the binary over a dynamic file, maximize custom counters (experimental):\n"
-           AB "  " PROG_NAME " -Df -- /usr/bin/tiffinfo -D " _HF_FILE_PLACEHOLDER AC "\n"
-#endif /* defined(_HF_ARCH_LINUX) */
-          );
-    /*  *INDENT-ON* */
+    struct itimerval it = {
+        .it_value = {.tv_sec = 1,.tv_usec = 0},
+        .it_interval = {.tv_sec = 1,.tv_usec = 0},
+    };
+    if (setitimer(ITIMER_REAL, &it, NULL) == -1) {
+        PLOG_F("setitimer(ITIMER_REAL)");
+    }
+}
 
-    if (exit_success) {
-        exit(EXIT_SUCCESS);
-    } else {
-        exit(EXIT_FAILURE);
+static void setupSignalsPreThr(void)
+{
+    /* Block signals which should be handled by the main thread */
+    sigset_t ss;
+    sigemptyset(&ss);
+    sigaddset(&ss, SIGTERM);
+    sigaddset(&ss, SIGINT);
+    sigaddset(&ss, SIGQUIT);
+    sigaddset(&ss, SIGALRM);
+    if (sigprocmask(SIG_BLOCK, &ss, NULL) != 0) {
+        PLOG_F("pthread_sigmask(SIG_BLOCK)");
+    }
+}
+
+static void setupSignalsPostThr(void)
+{
+    struct sigaction sa = {
+        .sa_handler = sigHandler,
+        .sa_flags = 0,
+    };
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGTERM, &sa, NULL) == -1) {
+        PLOG_F("sigaction(SIGTERM) failed");
+    }
+    if (sigaction(SIGINT, &sa, NULL) == -1) {
+        PLOG_F("sigaction(SIGINT) failed");
+    }
+    if (sigaction(SIGQUIT, &sa, NULL) == -1) {
+        PLOG_F("sigaction(SIGQUIT) failed");
+    }
+    if (sigaction(SIGALRM, &sa, NULL) == -1) {
+        PLOG_F("sigaction(SIGQUIT) failed");
+    }
+    /* Unblock signals which should be handled by the main thread */
+    sigset_t ss;
+    sigemptyset(&ss);
+    sigaddset(&ss, SIGTERM);
+    sigaddset(&ss, SIGINT);
+    sigaddset(&ss, SIGQUIT);
+    sigaddset(&ss, SIGALRM);
+    if (sigprocmask(SIG_UNBLOCK, &ss, NULL) != 0) {
+        PLOG_F("pthread_sigmask(SIG_UNBLOCK)");
     }
 }
 
 int main(int argc, char **argv)
 {
-    int c;
-    int ll = l_INFO;
-    honggfuzz_t hfuzz = {
-        .cmdline = NULL,
-        .inputFile = NULL,
-        .nullifyStdio = false,
-        .fuzzStdin = false,
-        .saveUnique = false,
-        .fileExtn = "fuzz",
-        .flipRate = 0.001f,
-        .externalCommand = NULL,
-        .dictionaryFile = NULL,
-        .dictionary = NULL,
-        .dictionaryCnt = 0,
-        .maxFileSz = (1024 * 1024),
-        .tmOut = 3,
-        .mutationsMax = 0,
-        .mutationsCnt = 0,
-        .threadsMax = 2,
-        .ignoreAddr = NULL,
-        .reportFile = _HF_REPORT_FILE,
-        .asLimit = 0UL,
-        .files = NULL,
-        .fileCnt = 0,
-        .pid = 0,
-        .envs = {[0 ... (ARRAYSIZE(hfuzz.envs) - 1)] = NULL,},
-        .dynFileMethod = _HF_DYNFILE_NONE,
-        .dynamicFileBest = NULL,
-        .dynamicFileBestSz = 1,
-        .branchBestCnt = {[0 ... (ARRAYSIZE(hfuzz.branchBestCnt) - 1)] = 0,},
-        .dynamicRegressionCnt = 0,
-        .dynamicCutOffAddr = ~(0ULL),
-        .dynamicFile_mutex = PTHREAD_MUTEX_INITIALIZER,
+    /*
+     * Work around CygWin/MinGW
+     */
+    char **myargs = (char **)util_Malloc(sizeof(char *) * (argc + 1));
+    defer {
+        free(myargs);
     };
 
-    if (argc < 2) {
-        usage(true);
+    int i;
+    for (i = 0U; i < argc; i++) {
+        myargs[i] = argv[i];
     }
+    myargs[i] = NULL;
 
-    for (;;) {
-        c = getopt(argc, argv, "-?hqsuf:d:e:r:c:F:D:t:a:R:n:N:l:p:g:o:E:w:");
-        if (c < 0)
-            break;
-
-        switch (c) {
-        case 'f':
-            hfuzz.inputFile = optarg;
-            break;
-        case 'h':
-        case '?':
-            usage(true);
-            break;
-        case 'q':
-            hfuzz.nullifyStdio = true;
-            break;
-        case 's':
-            hfuzz.fuzzStdin = true;
-            break;
-        case 'u':
-            hfuzz.saveUnique = true;
-            break;
-        case 'd':
-            ll = atoi(optarg);
-            break;
-        case 'e':
-            hfuzz.fileExtn = optarg;
-            break;
-        case 'r':
-            hfuzz.flipRate = strtod(optarg, NULL);
-            break;
-        case 'c':
-            hfuzz.externalCommand = optarg;
-            break;
-        case 'F':
-            hfuzz.maxFileSz = strtoul(optarg, NULL, 0);
-            break;
-        case 'D':
-            switch (optarg[0]) {
-            case 'i':
-                hfuzz.dynFileMethod |= _HF_DYNFILE_INSTR_COUNT;
-                break;
-            case 'b':
-                hfuzz.dynFileMethod |= _HF_DYNFILE_BRANCH_COUNT;
-                break;
-            case 'p':
-                hfuzz.dynFileMethod |= _HF_DYNFILE_UNIQUE_BLOCK_COUNT;
-                break;
-            case 'e':
-                hfuzz.dynFileMethod |= _HF_DYNFILE_UNIQUE_EDGE_COUNT;
-                break;
-            case 'f':
-                hfuzz.dynFileMethod |= _HF_DYNFILE_CUSTOM;
-                break;
-            default:
-                LOGMSG(l_ERROR, "Unknown -D mode");
-                usage(EXIT_FAILURE);
-                break;
-            }
-            break;
-        case 't':
-            hfuzz.tmOut = atol(optarg);
-            break;
-        case 'a':
-            hfuzz.ignoreAddr = (void *)strtoul(optarg, NULL, 0);
-            break;
-        case 'R':
-            hfuzz.reportFile = optarg;
-            break;
-        case 'n':
-            hfuzz.threadsMax = atol(optarg);
-            break;
-        case 'N':
-            hfuzz.mutationsMax = atol(optarg);
-            break;
-        case 'l':
-            hfuzz.asLimit = strtoul(optarg, NULL, 0);
-            break;
-        case 'p':
-            hfuzz.pid = atoi(optarg);
-            break;
-        case 'g':
-            hfuzz.dynamicRegressionCnt = atoi(optarg);
-            break;
-        case 'o':
-            hfuzz.dynamicCutOffAddr = strtoull(optarg, NULL, 0);
-            break;
-        case 'E':
-            for (size_t i = 0; i < ARRAYSIZE(hfuzz.envs); i++) {
-                if (hfuzz.envs[i] == NULL) {
-                    hfuzz.envs[i] = optarg;
-                    break;
-                }
-            }
-            break;
-        case 'w':
-            hfuzz.dictionaryFile = optarg;
-            break;
-        default:
-            break;
-        }
+    if (cmdlineParse(argc, myargs, &hfuzz) == false) {
+        LOG_F("Parsing of the cmd-line arguments failed");
     }
-    hfuzz.cmdline = &argv[optind];
-    log_setMinLevel(ll);
-
-    if (hfuzz.dynamicFileBestSz > hfuzz.maxFileSz) {
-        LOGMSG(l_FATAL,
-               "Initial dynamic file size cannot be larger than maximum file size (%zu > %zu)",
-               hfuzz.dynamicFileBestSz, hfuzz.maxFileSz);
-    }
-
-    if ((hfuzz.dynamicFileBest = malloc(hfuzz.maxFileSz)) == NULL) {
-        LOGMSG(l_FATAL, "malloc(%zu) failed", hfuzz.maxFileSz);
-    }
-
-    if (!hfuzz.cmdline[0]) {
-        LOGMSG(l_FATAL, "Please specify a binary to fuzz");
-        usage(false);
-    }
-
-    if (!hfuzz.fuzzStdin && !checkFor_FILE_PLACEHOLDER(hfuzz.cmdline)) {
-        LOGMSG(l_FATAL,
-               "You must specify '" _HF_FILE_PLACEHOLDER
-               "' when the -s (stdin fuzzing) option is not set");
-        usage(false);
-    }
-
-    if (strchr(hfuzz.fileExtn, '/')) {
-        LOGMSG(l_FATAL, "The file extension contains the '/' character: '%s'", hfuzz.fileExtn);
-        usage(false);
-    }
-
-    if (hfuzz.pid > 0) {
-        LOGMSG(l_INFO, "PID=%d specified, lowering maximum number of concurrent threads to 1");
-        hfuzz.threadsMax = 1;
-    }
-
-    LOGMSG(l_INFO,
-           "debugLevel: %d, inputFile '%s', nullifyStdio: %d, fuzzStdin: %d, saveUnique: %d, flipRate: %lf, "
-           "externalCommand: '%s', tmOut: %ld, mutationsMax: %ld, threadsMax: %ld, fileExtn '%s', ignoreAddr: %p, "
-           "memoryLimit: %lu (MiB), fuzzExe: '%s', fuzzedPid: %d",
-           ll, hfuzz.inputFile, hfuzz.nullifyStdio ? 1 : 0,
-           hfuzz.fuzzStdin ? 1 : 0, hfuzz.saveUnique ? 1 : 0,
-           hfuzz.flipRate,
-           hfuzz.externalCommand == NULL ? "NULL" : hfuzz.externalCommand,
-           hfuzz.tmOut, hfuzz.mutationsMax, hfuzz.threadsMax,
-           hfuzz.fileExtn, hfuzz.ignoreAddr, hfuzz.asLimit, hfuzz.cmdline[0], hfuzz.pid);
 
     if (!files_init(&hfuzz)) {
-        LOGMSG(l_FATAL, "Couldn't load input files");
+        LOG_F("Couldn't load input files");
         exit(EXIT_FAILURE);
     }
 
     if (hfuzz.dictionaryFile && (files_parseDictionary(&hfuzz) == false)) {
-        LOGMSG(l_FATAL, "Couldn't parse dictionary file ('%s')", hfuzz.dictionaryFile);
+        LOG_F("Couldn't parse dictionary file ('%s')", hfuzz.dictionaryFile);
+    }
+
+    if (hfuzz.blacklistFile && (files_parseBlacklist(&hfuzz) == false)) {
+        LOG_F("Couldn't parse stackhash blacklist file ('%s')", hfuzz.blacklistFile);
     }
 
     /*
      * So far so good
      */
-    fuzz_main(&hfuzz);
+    setupSignalsPreThr();
+    fuzz_threads(&hfuzz);
+    setupSignalsPostThr();
 
-    free(hfuzz.dynamicFileBest);
+    setupTimer();
+    for (;;) {
+        if (hfuzz.useScreen) {
+            display_display(&hfuzz);
+        }
+        if (sigReceived > 0) {
+            break;
+        }
+        if (ATOMIC_GET(hfuzz.threadsFinished) >= hfuzz.threadsMax) {
+            break;
+        }
+        pause();
+    }
 
-    abort();                    /* NOTREACHED */
+    if (sigReceived > 0) {
+        LOG_I("Signal %d (%s) received, terminating", sigReceived, strsignal(sigReceived));
+    }
+
+    /* Clean-up global buffers */
+    free(hfuzz.files);
+    if (hfuzz.dictionary) {
+        for (size_t i = 0; i < hfuzz.dictionaryCnt; i++) {
+            free(hfuzz.dictionary[i]);
+        }
+        free(hfuzz.dictionary);
+    }
+    if (hfuzz.blacklist) {
+        free(hfuzz.blacklist);
+    }
+    if (hfuzz.sanOpts.asanOpts) {
+        free(hfuzz.sanOpts.asanOpts);
+    }
+    if (hfuzz.sanOpts.ubsanOpts) {
+        free(hfuzz.sanOpts.ubsanOpts);
+    }
+    if (hfuzz.sanOpts.msanOpts) {
+        free(hfuzz.sanOpts.msanOpts);
+    }
+    if (hfuzz.linux.pidCmd) {
+        free(hfuzz.linux.pidCmd);
+    }
+
     return EXIT_SUCCESS;
 }

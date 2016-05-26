@@ -25,6 +25,7 @@
 #include "report.h"
 
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -34,6 +35,38 @@
 
 static int reportFD = -1;
 
+#if defined(_HF_ARCH_LINUX)
+static void report_printdynFileMethod(honggfuzz_t * hfuzz)
+{
+    dprintf(reportFD, " dynFileMethod: ");
+    if (hfuzz->dynFileMethod == 0)
+        dprintf(reportFD, "NONE\n");
+    else {
+        if (hfuzz->dynFileMethod & _HF_DYNFILE_INSTR_COUNT)
+            dprintf(reportFD, "INSTR_COUNT ");
+        if (hfuzz->dynFileMethod & _HF_DYNFILE_BRANCH_COUNT)
+            dprintf(reportFD, "BRANCH_COUNT ");
+        if (hfuzz->dynFileMethod & _HF_DYNFILE_BTS_BLOCK)
+            dprintf(reportFD, "BLOCK_COUNT ");
+        if (hfuzz->dynFileMethod & _HF_DYNFILE_BTS_EDGE)
+            dprintf(reportFD, "EDGE_COUNT ");
+        if (hfuzz->dynFileMethod & _HF_DYNFILE_CUSTOM)
+            dprintf(reportFD, "CUSTOM ");
+
+        dprintf(reportFD, "\n");
+    }
+}
+#endif
+
+static void report_printTargetCmd(honggfuzz_t * hfuzz)
+{
+    dprintf(reportFD, " fuzzTarget   : ");
+    for (int x = 0; hfuzz->cmdline[x]; x++) {
+        dprintf(reportFD, "%s ", hfuzz->cmdline[x]);
+    }
+    dprintf(reportFD, "\n");
+}
+
 void report_Report(honggfuzz_t * hfuzz, char *s)
 {
     if (s[0] == '\0') {
@@ -41,21 +74,52 @@ void report_Report(honggfuzz_t * hfuzz, char *s)
     }
 
     if (reportFD == -1) {
-        reportFD = open(hfuzz->reportFile, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    }
-    if (reportFD == -1) {
-        LOGMSG_P(l_FATAL, "Couldn't open('%s') for writing", hfuzz->reportFile);
+        char reportFName[PATH_MAX];
+        if (hfuzz->reportFile == NULL) {
+            snprintf(reportFName, sizeof(reportFName), "%s/%s", hfuzz->workDir, _HF_REPORT_FILE);
+        } else {
+            snprintf(reportFName, sizeof(reportFName), "%s", hfuzz->reportFile);
+        }
+
+        reportFD = open(reportFName, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        if (reportFD == -1) {
+            PLOG_F("Couldn't open('%s') for writing", reportFName);
+        }
     }
 
     char localtmstr[PATH_MAX];
-    util_getLocalTime("%F.%H:%M:%S", localtmstr, sizeof(localtmstr));
+    util_getLocalTime("%F.%H:%M:%S", localtmstr, sizeof(localtmstr), time(NULL));
 
     dprintf(reportFD,
             "=====================================================================\n"
             "TIME: %s\n"
             "=====================================================================\n"
-            "%s" "=====================================================================\n",
-            localtmstr, s);
+            "FUZZER ARGS:\n"
+            " flipRate     : %lf\n"
+            " externalCmd  : %s\n"
+            " fuzzStdin    : %s\n"
+            " timeout      : %ld (sec)\n"
+            " ignoreAddr   : %p\n"
+            " memoryLimit  : %" PRIu64 " (MiB)\n"
+            " targetPid    : %d\n"
+            " targetCmd    : %s\n"
+            " wordlistFile : %s\n",
+            localtmstr,
+            hfuzz->origFlipRate,
+            hfuzz->externalCommand == NULL ? "NULL" : hfuzz->externalCommand,
+            hfuzz->fuzzStdin ? "TRUE" : "FALSE",
+            hfuzz->tmOut,
+            hfuzz->linux.ignoreAddr,
+            hfuzz->asLimit,
+            hfuzz->linux.pid,
+            hfuzz->linux.pidCmd, hfuzz->dictionaryFile == NULL ? "NULL" : hfuzz->dictionaryFile);
 
-    return;
+#if defined(_HF_ARCH_LINUX)
+    report_printdynFileMethod(hfuzz);
+#endif
+
+    report_printTargetCmd(hfuzz);
+
+    dprintf(reportFD,
+            "%s" "=====================================================================\n", s);
 }

@@ -21,11 +21,23 @@
  *
  */
 
-#ifndef _UTIL_H_
-#define _UTIL_H_
+#ifndef _HF_UTIL_H_
+#define _HF_UTIL_H_
 
 #include <stdarg.h>
 #include <stdint.h>
+
+#define MX_LOCK(m) util_mutexLock(m, __func__, __LINE__)
+#define MX_UNLOCK(m) util_mutexUnlock(m, __func__, __LINE__)
+#define MX_SCOPED_LOCK(m) MX_LOCK(m); defer { MX_UNLOCK(m); }
+
+extern void *util_Malloc(size_t sz);
+
+extern void *util_Calloc(size_t sz);
+
+extern void *util_MMap(size_t sz);
+
+extern char *util_StrDup(const char *s);
 
 extern uint64_t util_rndGet(uint64_t min, uint64_t max);
 
@@ -35,21 +47,24 @@ extern int util_ssnprintf(char *str, size_t size, const char *format, ...);
 
 extern int util_vssnprintf(char *str, size_t size, const char *format, va_list ap);
 
-extern void util_getLocalTime(const char *fmt, char *buf, size_t len);
+extern void util_getLocalTime(const char *fmt, char *buf, size_t len, time_t tm);
 
 extern void util_nullifyStdio(void);
 
-extern bool util_redirectStdin(char *inputFile);
-
-extern void util_recoverStdio(void);
+extern bool util_redirectStdin(const char *inputFile);
 
 extern uint64_t util_hash(const char *buf, size_t len);
 
 extern int64_t util_timeNowMillis(void);
 
-extern uint16_t util_ToFromBE16(uint16_t val);
-extern uint16_t util_ToFromLE16(uint16_t val);
-extern uint32_t util_ToFromBE32(uint32_t val);
-extern uint32_t util_ToFromLE32(uint32_t val);
+extern uint64_t util_getUINT32(const uint8_t * buf);
+extern uint64_t util_getUINT64(const uint8_t * buf);
+
+extern void util_mutexLock(pthread_mutex_t * mutex, const char *func, int line);
+extern void util_mutexUnlock(pthread_mutex_t * mutex, const char *func, int line);
+
+extern int64_t fastArray64Search(uint64_t * array, size_t arraySz, uint64_t key);
+
+extern bool util_isANumber(const char *s);
 
 #endif

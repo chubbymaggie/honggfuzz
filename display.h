@@ -1,6 +1,6 @@
 /*
  *
- * honggfuzz - architecture dependent code
+ * honggfuzz - display statistics
  * -----------------------------------------
  *
  * Author: Robert Swiecki <swiecki@google.com>
@@ -21,12 +21,9 @@
  *
  */
 
-#ifndef _LINUX_PTRACE_H_
-#define _LINUX_PTRACE_H_
+#ifndef _HF_DISPLAY_H_
+#define _HF_DISPLAY_H_
 
-extern bool arch_ptraceEnable(honggfuzz_t * fuzz);
-extern void arch_ptraceAnalyze(honggfuzz_t * fuzz, int status, pid_t pid, fuzzer_t * fuzzer);
-extern bool arch_ptraceAttach(pid_t pid);
-extern uint64_t arch_ptraceGetCustomPerf(honggfuzz_t * fuzz, pid_t pid);
+extern void display_display(honggfuzz_t * hfuzz);
 
 #endif

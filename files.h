@@ -21,15 +21,15 @@
  *
  */
 
-#ifndef _FILES_H_
-#define _FILES_H_
+#ifndef _HF_FILES_H_
+#define _HF_FILES_H_
 
 #include <stdint.h>
 #include <unistd.h>
 
 extern bool files_init(honggfuzz_t * hfuzz);
 
-extern size_t files_readFileToBufMax(char *fileName, uint8_t * buf, size_t fileMaxSz);
+extern ssize_t files_readFileToBufMax(char *fileName, uint8_t * buf, size_t fileMaxSz);
 
 extern bool files_writeBufToFile(char *fileName, uint8_t * buf, size_t fileSz, int flags);
 
@@ -37,14 +37,22 @@ extern bool files_writeToFd(int fd, uint8_t * buf, size_t fileSz);
 
 extern bool files_writeStrToFd(int fd, char *str);
 
-extern bool files_readFromFd(int fd, uint8_t * buf, size_t fileSz);
+extern ssize_t files_readFromFd(int fd, uint8_t * buf, size_t fileSz);
 
 extern bool files_writePatternToFd(int fd, off_t size, unsigned char p);
 
 extern bool files_exists(char *fileName);
 
-extern char *files_basename(char *fileName);
+extern const char *files_basename(char *fileName);
 
 extern bool files_parseDictionary(honggfuzz_t * hfuzz);
+
+extern bool files_copyFile(const char *source, const char *destination, bool * dstExists);
+
+extern bool files_parseBlacklist(honggfuzz_t * hfuzz);
+
+extern uint8_t *files_mapFile(char *fileName, off_t * fileSz, int *fd, bool isWritable);
+
+extern bool files_readPidFromFile(const char *fileName, pid_t * pidPtr);
 
 #endif

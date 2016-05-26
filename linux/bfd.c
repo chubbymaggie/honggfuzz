@@ -53,29 +53,26 @@ static bool arch_bfdInit(pid_t pid, bfd_t * bfdParams)
     char fname[PATH_MAX];
     snprintf(fname, sizeof(fname), "/proc/%d/exe", pid);
     if ((bfdParams->bfdh = bfd_openr(fname, 0)) == NULL) {
-        LOGMSG(l_ERROR, "bfd_openr(%s) failed", fname);
+        LOG_E("bfd_openr(%s) failed", fname);
         return false;
     }
 
     if (!bfd_check_format(bfdParams->bfdh, bfd_object)) {
-        LOGMSG(l_ERROR, "bfd_check_format() failed");
+        LOG_E("bfd_check_format() failed");
         return false;
     }
 
     int storage_needed = bfd_get_symtab_upper_bound(bfdParams->bfdh);
     if (storage_needed <= 0) {
-        LOGMSG(l_ERROR, "bfd_get_symtab_upper_bound() returned '%d'", storage_needed);
+        LOG_E("bfd_get_symtab_upper_bound() returned '%d'", storage_needed);
         return false;
     }
 
-    if ((bfdParams->syms = (asymbol **) malloc(storage_needed)) == NULL) {
-        LOGMSG_P(l_ERROR, "malloc(%d) failed", storage_needed);
-        return false;
-    }
+    bfdParams->syms = (asymbol **) util_Malloc(storage_needed);
     bfd_canonicalize_symtab(bfdParams->bfdh, bfdParams->syms);
 
     if ((bfdParams->section = bfd_get_section_by_name(bfdParams->bfdh, ".text")) == NULL) {
-        LOGMSG(l_ERROR, "bfd_get_section_by_name('.text') failed");
+        LOG_E("bfd_get_section_by_name('.text') failed");
         return false;
     }
 
@@ -88,27 +85,29 @@ static void arch_bfdDestroy(bfd_t * bfdParams)
         free(bfdParams->syms);
     }
     if (bfdParams->bfdh) {
-        bfd_close_all_done(bfdParams->bfdh);
+        bfd_close(bfdParams->bfdh);
     }
-    return;
 }
 
 void arch_bfdResolveSyms(pid_t pid, funcs_t * funcs, size_t num)
 {
     /* Guess what? libbfd is not multi-threading safe */
-    while (pthread_mutex_lock(&arch_bfd_mutex)) ;
+    MX_SCOPED_LOCK(&arch_bfd_mutex);
 
     bfd_init();
 
-    bfd_t bfdParams = {
+    __block bfd_t bfdParams = {
         .bfdh = NULL,
         .section = NULL,
         .syms = NULL,
     };
 
     if (arch_bfdInit(pid, &bfdParams) == false) {
-        goto out;
+        return;
     }
+    defer {
+        arch_bfdDestroy(&bfdParams);
+    };
 
     const char *func;
     const char *file;
@@ -128,12 +127,6 @@ void arch_bfdResolveSyms(pid_t pid, funcs_t * funcs, size_t num)
             funcs[i].line = line;
         }
     }
-
- out:
-    arch_bfdDestroy(&bfdParams);
-
-    while (pthread_mutex_unlock(&arch_bfd_mutex)) ;
-    return;
 }
 
 static int arch_bfdFPrintF(void *buf, const char *fmt, ...)
@@ -148,7 +141,7 @@ static int arch_bfdFPrintF(void *buf, const char *fmt, ...)
 
 void arch_bfdDisasm(pid_t pid, uint8_t * mem, size_t size, char *instr)
 {
-    while (pthread_mutex_lock(&arch_bfd_mutex)) ;
+    MX_SCOPED_LOCK(&arch_bfd_mutex);
 
     bfd_init();
 
@@ -156,19 +149,22 @@ void arch_bfdDisasm(pid_t pid, uint8_t * mem, size_t size, char *instr)
     snprintf(fname, sizeof(fname), "/proc/%d/exe", pid);
     bfd *bfdh = bfd_openr(fname, NULL);
     if (bfdh == NULL) {
-        LOGMSG(l_WARN, "bfd_openr('/proc/%d/exe') failed", pid);
-        goto out;
+        LOG_W("bfd_openr('/proc/%d/exe') failed", pid);
+        return;
     }
+    defer {
+        bfd_close(bfdh);
+    };
 
     if (!bfd_check_format(bfdh, bfd_object)) {
-        LOGMSG(l_WARN, "bfd_check_format() failed");
-        goto out;
+        LOG_W("bfd_check_format() failed");
+        return;
     }
 
     disassembler_ftype disassemble = disassembler(bfdh);
     if (disassemble == NULL) {
-        LOGMSG(l_WARN, "disassembler() failed");
-        goto out;
+        LOG_W("disassembler() failed");
+        return;
     }
 
     struct disassemble_info info;
@@ -185,10 +181,4 @@ void arch_bfdDisasm(pid_t pid, uint8_t * mem, size_t size, char *instr)
     if (disassemble(0, &info) <= 0) {
         snprintf(instr, _HF_INSTR_SZ, "[DIS-ASM_FAILURE]");
     }
-
- out:
-    bfdh ? bfd_close_all_done(bfdh) : 0;
-
-    while (pthread_mutex_unlock(&arch_bfd_mutex)) ;
-    return;
 }

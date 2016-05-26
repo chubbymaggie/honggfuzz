@@ -21,12 +21,12 @@
  *
  */
 
-#ifndef _MANGLE_H_
-#define _MANGLE_H_
+#ifndef _HF_MANGLE_H_
+#define _HF_MANGLE_H_
 
 #include <stdint.h>
 
-extern void mangle_mangleContent(honggfuzz_t * hfuzz, uint8_t * bug, size_t bufSz);
+extern void mangle_mangleContent(honggfuzz_t * hfuzz, fuzzer_t * fuzzer);
 extern bool mangle_Resize(honggfuzz_t * hfuzz, uint8_t * buf, size_t * bufSz);
 
 #endif
