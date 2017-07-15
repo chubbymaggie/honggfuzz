@@ -1,18 +1,25 @@
 # Android Platform #
 
-Honggfuzz (as of version 0.6) supports Android OS (NDK cross-compilation) using both ptrace() API and POSIX signals interface. When ptrace() API is enabled, honggfuzz's engine prevents monitored signals from reaching the debugger (no logcat backtraces & tombstones), since the fuzzer's runtime analysis was affected.
+Honggfuzz (as of version 0.6) supports Android OS (NDK cross-compilation) using
+both ptrace() API and POSIX signals interface. When ptrace() API is enabled,
+honggfuzz's engine prevents monitored signals from reaching the debugger (no
+logcat backtraces & tombstones), since the fuzzer's runtime analysis is
+affected.
 
 ## Requirements ##
 
-  * [Android NDK](https://developer.android.com/ndk/index.html): User has to manually install NDK and set environment PATH
-  * [libunwind](http://www.nongnu.org/libunwind/download.html): In case of first build an upstream git fork is executed followed by required patches
-  * [capstone](http://www.capstone-engine.org/download.html): In case of first build an upstream git fork is executed
+* [Android NDK](https://developer.android.com/ndk/index.html): User has to
+manually install NDK and set environment PATH
+* [libunwind](http://www.nongnu.org/libunwind/download.html): In case of first
+build an upstream git fork is executed followed by required patches
+* [capstone](http://www.capstone-engine.org/download.html): In case of first
+build an upstream git fork is executed
 
 | **Dependency** | **Last Tested Version** |
 |:-------|:-----------|
-| **Android NDK** | r11c with Android API 23 (Marshmallow 6.0) |
-| **libunwind** | upstream master commit [396b6c7] |
-| **capstone** | upstream master commit [0793345] |
+| **Android NDK** | r15 with Android API 24 (Nougat 7.0) |
+| **libunwind** | upstream master commit [bc8698f] |
+| **capstone** | 3.0.4 stable version |
 
 ## Compatibility list ##
 
@@ -26,91 +33,90 @@ It has been tested under the following CPU architectures:
 | **x86** | ptrace() API & POSIX signal interface |
 | **x86_64** | ptrace() API & POSIX signal interface |
 
-_`*`) libunwind fails to extract frames if fuzzing target is 32bit. Prefer a 32bit build for such targets._
+_`*`) libunwind fails to extract frames if fuzzing target is 32bit. Prefer a32bit build for such targets._
+
 
 ## Cross-Compiling ##
 ## Dependencies ##
 
-Helper bash scripts are present to automate capstone & libunwind builds for target CPU in case of ptrace() API interface being used. From project root directory execute the following to compile the two libraries for the matching architecture:
+A series of helper bash scripts have been created under the
+`third_party/android/scripts` directory to automate the dependencies
+configuration & build process. The scripts are automatically invoked from the
+makefile, based on the selected target CPU. Normally you'll not need to manually
+execute or modify them.
 
-  * third_party/android/scripts/compile-libunwind.sh third_party/android/libunwind \<arch\>
-  * third_party/android/scripts/compile-capstone.sh third_party/android/capstone \<arch\>
+## Building
+### All CPUs ###
+For convenience the master makefile defines an `android-all` target that
+automatically builds honggfuzz (and its dependencies) for all the supported
+Android CPUs.
 
-Were \<arch\>:
-
-  * "arm": For armeabi & armeabi-v7a
-  * "arm64": For arm64-v8a*
-  * "x86"
-  * "x86_64"
-
-For example in case of arm:
+From the root directory execute the following. Build output is available under
+the `libs` directory.
 
 ```
-$ third_party/android/scripts/compile-libunwind.sh third_party/android/libunwind arm
-[!] libunwind not found. Fetching a fresh copy
-Cloning into 'third_party/android/libunwind'...
-remote: Counting objects: 14860, done.
-remote: Compressing objects: 100% (3855/3855), done.
-remote: Total 14860 (delta 10932), reused 14860 (delta 10932)
-Receiving objects: 100% (14860/14860), 3.46 MiB | 856.00 KiB/s, done.
-Resolving deltas: 100% (10932/10932), done.
-Checking connectivity... done.
-patching file src/ptrace/_UPT_access_reg.c
-patching file src/ptrace/_UPT_access_fpreg.c
+$ make android-all
 ...
-[*] 'arm' libunwind  available at 'third_party/android/libunwind/arm'
+$ tree libs/
+libs/
+├── arm64-v8a
+│   ├── android_api.txt
+│   ├── honggfuzz
+│   ├── libhfuzz.a
+│   └── ndk_toolchain.txt
+├── armeabi
+│   ├── android_api.txt
+│   ├── honggfuzz
+│   ├── libhfuzz.a
+│   └── ndk_toolchain.txt
+├── armeabi-v7a
+│   ├── android_api.txt
+│   ├── honggfuzz
+│   ├── libhfuzz.a
+│   └── ndk_toolchain.txt
+├── x86
+│   ├── android_api.txt
+│   ├── honggfuzz
+│   ├── libhfuzz.a
+│   └── ndk_toolchain.txt
+└── x86_64
+    ├── android_api.txt
+    ├── honggfuzz
+    ├── libhfuzz.a
+    └── ndk_toolchain.txt
+
+5 directories, 20 files
 ```
+
+
+### Specific CPU ###
+To build for a specific CPU use the `android` target with one of the supported
+ABI descriptions. Again the dependencies are automatically build.
+
 ```
-$ [!] capstone not found. Fetching a fresh copy
-Cloning into 'third_party/android/capstone'...
-remote: Counting objects: 16981, done.
-remote: Compressing objects: 100% (39/39), done.
-remote: Total 16981 (delta 18), reused 0 (delta 0), pack-reused 16942
-Receiving objects: 100% (16981/16981), 26.18 MiB | 1.24 MiB/s, done.
-Resolving deltas: 100% (12223/12223), done.
-Checking connectivity... done.
+$ make android ANDROID_APP_ABI=<arch>
 ...
-  GEN     capstone.pc
-[*] 'arm' libcapstone  available at 'third_party/android/capstone/arm'
 ```
 
-## Honggfuzz ##
+Were `<arch>` can be:
 
-| **Flags** | **Allowed Values** |
-|:-------|:-----------|
-| **ANDROID_DEBUG_ENABLED** | true, false (default: false) |
-| **ANDROID_APP_ABI** | armeabi, armeabi-v7a, arm64-v8a, x86, x86_64 (default: armeabi-v7a) |
-| **ANDROID_WITH_PTRACE** | true, false (default: true) `1`|
-| **ANDROID_API** | android-21, android-22, ... (default: android-21) `2` |
+* armeabi
+* armeabi-v7a (**default**)
+* arm64-v8a
+* x86
+* x86_64
 
-_`1`) in case of false, POSIX signals interface is used instead of PTRACE API_
 
-_`2`) Due to bionic incompatibilities only APIs >= 21 are supported_
+## Android specific flags ##
 
-After compiling the dependencies (ptrace() API only), from project's root directory execute make with android PHONY to cross-compile.
+| **Flag** | **Options** | **Description** |
+|:----------|:------------|:----------------|
+| **ANDROID_DEBUG_ENABLED** | true, false (default: false) | Enable Android debug builds |
+| **ANDROID_APP_ABI** | armeabi, armeabi-v7a, arm64-v8a, x86, x86_64 (default: armeabi-v7a) | Target CPU |
+| **ANDROID_WITH_PTRACE** | true, false (default: true) `1`| Fuzzing engine backend architecture |
+| **ANDROID_API** | android-21, android-22, ... (default: android-24) `2` | Target Android API |
+| **ANDROID_CLANG** | true, false (default: false) | Android NDK compiler toolchain to use |
 
-For example in case of ptrace() API for armeabi-v7a:
+_`1`) If false, POSIX signals interface is used instead of PTRACE API_
 
-```
-$ make -B android ANDROID_APP_ABI=armeabi-v7a
-ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=./android/Android.mk \
-			APP_PLATFORM=android-21 APP_ABI=armeabi-v7a
-********************************************************************
-Android PTRACE build: Will prevent debuggerd from processing crashes
-********************************************************************
-make[1]: Entering directory `/Users/anestisb/Tools/Fuzzers/honggfuzz'
-[armeabi-v7a] Compile thumb  : honggfuzz <= honggfuzz.c
-[armeabi-v7a] Compile thumb  : honggfuzz <= log.c
-[armeabi-v7a] Compile thumb  : honggfuzz <= files.c
-[armeabi-v7a] Compile thumb  : honggfuzz <= fuzz.c
-[armeabi-v7a] Compile thumb  : honggfuzz <= report.c
-[armeabi-v7a] Compile thumb  : honggfuzz <= mangle.c
-[armeabi-v7a] Compile thumb  : honggfuzz <= util.c
-[armeabi-v7a] Compile thumb  : honggfuzz <= arch.c
-[armeabi-v7a] Compile thumb  : honggfuzz <= ptrace_utils.c
-[armeabi-v7a] Compile thumb  : honggfuzz <= perf.c
-[armeabi-v7a] Compile thumb  : honggfuzz <= unwind.c
-[armeabi-v7a] Executable     : honggfuzz
-[armeabi-v7a] Install        : honggfuzz => libs/armeabi-v7a/honggfuzz
-make[1]: Leaving directory `/Users/anestisb/Tools/Fuzzers/honggfuzz'
-```
+_`2`) Due to bionic incompatibilities, only APIs >= 21 are supported_

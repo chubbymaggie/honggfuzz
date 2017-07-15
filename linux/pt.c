@@ -21,13 +21,14 @@
  *
  */
 
-#include "common.h"
-#include "linux/pt.h"
+#include "../libcommon/common.h"
 
 #include <linux/perf_event.h>
 #include <inttypes.h>
 
-#include "log.h"
+#include "pt.h"
+#include "../libcommon/log.h"
+#include "../libcommon/util.h"
 
 #ifdef _HF_LINUX_INTEL_PT_LIB
 
@@ -189,19 +190,16 @@ inline static void perf_ptAnalyzePkt(honggfuzz_t * hfuzz, fuzzer_t * fuzzer,
         LOG_F("pt_last_ip_update_ip() failed: %s", pt_errstr(errcode));
     }
 
-    uint64_t ip;
-    errcode = pt_last_ip_query(&ip, last_ip);
-    if (errcode < 0) {
-        return;
-    }
     /* Update only on TIP, other packets don't indicate a branch */
     if (packet->type == ppt_tip) {
-        register size_t pos = ip % (hfuzz->bbMapSz * 8);
-        size_t byteOff = pos / 8;
-        uint8_t bitSet = (uint8_t) (1 << (pos % 8));
-        register uint8_t prev = ATOMIC_POST_OR(hfuzz->bbMap[byteOff], bitSet);
-        if (!(prev & bitSet)) {
-            fuzzer->linux.hwCnts.bbCnt++;
+        uint64_t ip;
+        errcode = pt_last_ip_query(&ip, last_ip);
+        if (errcode == 0) {
+            ip &= _HF_PERF_BITMAP_BITSZ_MASK;
+            register uint8_t prev = ATOMIC_BTS(hfuzz->feedback->bbMapPc, ip);
+            if (!prev) {
+                fuzzer->linux.hwCnts.newBBCnt++;
+            }
         }
     }
     return;
@@ -211,10 +209,13 @@ void arch_ptAnalyze(honggfuzz_t * hfuzz, fuzzer_t * fuzzer)
 {
     struct perf_event_mmap_page *pem = (struct perf_event_mmap_page *)fuzzer->linux.perfMmapBuf;
 
+    uint64_t aux_tail = ATOMIC_GET(pem->aux_tail);
+    uint64_t aux_head = ATOMIC_GET(pem->aux_head);
+
     struct pt_config ptc;
     pt_config_init(&ptc);
-    ptc.begin = &fuzzer->linux.perfMmapAux[pem->aux_tail];
-    ptc.end = &fuzzer->linux.perfMmapAux[pem->aux_head - 1];
+    ptc.begin = &fuzzer->linux.perfMmapAux[aux_tail];
+    ptc.end = &fuzzer->linux.perfMmapAux[aux_head - 1];
 
     int errcode = pt_cpu_errata(&ptc.errata, &ptc.cpu);
     if (errcode < 0) {

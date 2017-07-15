@@ -15,15 +15,29 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-if [ -z "$NDK" ]; then
-  # Search in $PATH
-  if [[ $(which ndk-build) != "" ]]; then
-    NDK=$(dirname $(which ndk-build))
+#set -x # debug
+
+readonly JOBS=$(getconf _NPROCESSORS_ONLN)
+
+abort() {
+  # Revert patches if not debugging
+  if [[ "$-" == *x* ]]; then
+    echo "[!] git patches are not reverted since running under debug mode"
   else
-    echo "[-] Could not detect Android NDK dir"
-    exit 1
+    # Extra care to ensure we're under expected project
+    if [[ $# -eq 1 && "$(basename $(git rev-parse --show-toplevel))" == "libunwind" ]]; then
+      echo "[*] Resetting locally applied patches"
+      git reset --hard &>/dev/null || {
+        echo "[-] git reset failed"
+      }
+    fi
   fi
-fi 
+
+  cd - &>/dev/null
+  exit "$1"
+}
+
+trap "abort 1" SIGINT SIGTERM
 
 if [ $# -ne 2 ]; then
   echo "[-] Invalid arguments"
@@ -32,24 +46,74 @@ if [ $# -ne 2 ]; then
   exit 1
 fi
 
-readonly LIBUNWIND_DIR=$1
+readonly LIBUNWIND_DIR="$1"
 
-# Fetch if not already there
-if [ ! -d $LIBUNWIND_DIR ]; then
-    echo "[!] libunwind not found. Fetching a fresh copy"
-    git clone git://git.sv.gnu.org/libunwind.git $LIBUNWIND_DIR
+if [ ! -d "$LIBUNWIND_DIR/.git" ]; then
+  git submodule update --init third_party/android/libunwind || {
+    echo "[-] git submodules init failed"
+    exit 1
+  }
+fi
+
+# register client hooks
+hooksDir="$(git -C "$LIBUNWIND_DIR" rev-parse --git-dir)/hooks"
+mkdir -p "$hooksDir"
+
+if [ ! -f "$hooksDir/post-checkout" ]; then
+  cat > "$hooksDir/post-checkout" <<'endmsg'
+#!/usr/bin/env bash
+
+rm -f arm/*.a
+rm -f arm64/*.a
+rm -f x86/*.a
+rm -f x86_64/*.a
+endmsg
+  chmod +x "$hooksDir/post-checkout"
+fi
+
+# Change workspace
+cd "$LIBUNWIND_DIR" &>/dev/null
+
+if [ -z "$NDK" ]; then
+  # Search in $PATH
+  if [[ $(which ndk-build) != "" ]]; then
+    NDK=$(dirname $(which ndk-build))
+  else
+    echo "[-] Could not detect Android NDK dir"
+    abort 1
+  fi
+fi
+
+if [ -z "$ANDROID_API" ]; then
+  ANDROID_API="android-21"
+fi
+if ! echo "$ANDROID_API" | grep -qoE 'android-[0-9]{1,2}'; then
+  echo "[-] Invalid ANDROID_API '$ANDROID_API'"
+  abort 1
 fi
 
 case "$2" in
   arm|arm64|x86|x86_64)
-    readonly ARCH=$2
-    if [ ! -d $LIBUNWIND_DIR/$ARCH ] ; then mkdir -p $LIBUNWIND_DIR/$ARCH; fi
+    readonly ARCH="$2"
+    if [ ! -d "$ARCH" ] ; then mkdir -p "$ARCH"; fi
     ;;
   *)
     echo "[-] Invalid architecture"
-    exit 1
+    abort 1
     ;;
 esac
+
+# Check if previous build exists and matches selected ANDROID_API level
+# If API cache file not there always rebuild
+if [ -f "$ARCH/libunwind-$ARCH.a" ]; then
+  if [ -f "$ARCH/android_api.txt" ]; then
+    old_api=$(cat "$ARCH/android_api.txt")
+    if [[ "$old_api" == "$ANDROID_API" ]]; then
+      # No need to recompile
+      abort 0 true
+    fi
+  fi
+fi
 
 LC_LDFLAGS="-static"
 
@@ -57,9 +121,6 @@ LC_LDFLAGS="-static"
 # Remember to export UNW_DEBUG_LEVEL=<level>
 # where 1 < level < 16 (usually values up to 5 are enough)
 #LC_CFLAGS="$LC_FLAGS -DDEBUG"
-
-# Change workdir to simplify args
-cd $LIBUNWIND_DIR
 
 # Prepare toolchain
 case "$ARCH" in
@@ -85,71 +146,32 @@ esac
 # TODO: Automate global patching when all archs have been tested
 
 # Ptrace patches due to Android incompatibilities
-patch -N --dry-run --silent src/ptrace/_UPT_access_reg.c < ../patches/ptrace-libunwind_1.patch &>/dev/null
+git apply --check ../patches/libunwind.patch
 if [ $? -eq 0 ]; then
-  patch src/ptrace/_UPT_access_reg.c < ../patches/ptrace-libunwind_1.patch
+  git apply ../patches/libunwind.patch
   if [ $? -ne 0 ]; then
-    echo "[-] ptrace-libunwind_1 patch failed"
-    exit 1
+    echo "[-] Failed to apply libunwind patches"
+    abort 1
   fi
-fi
-
-patch -N --dry-run --silent src/ptrace/_UPT_access_fpreg.c < ../patches/ptrace-libunwind_2.patch &>/dev/null
-if [ $? -eq 0 ]; then
-  patch src/ptrace/_UPT_access_fpreg.c < ../patches/ptrace-libunwind_2.patch
-  if [ $? -ne 0 ]; then
-    echo "[-] ptrace-libunwind_2 patch failed"
-    exit 1
-  fi
-fi
-
-if [ "$ARCH" == "arm64" ]; then
-  # Missing libc functionality
-  patch -N --dry-run --silent include/libunwind-aarch64.h < ../patches/aarch64-libunwind_1.patch &>/dev/null
-  if [ $? -eq 0 ]; then
-    patch include/libunwind-aarch64.h < ../patches/aarch64-libunwind_1.patch
-    if [ $? -ne 0 ]; then
-      echo "[-] aarch64-libunwind_1 patch failed"
-      exit 1
-    fi
-  fi
-  # Frames ip bugs
-  patch -N --dry-run --silent src/aarch64/Gstep.c < ../patches/aarch64-libunwind_2.patch &>/dev/null
-  if [ $? -eq 0 ]; then
-    patch src/aarch64/Gstep.c < ../patches/aarch64-libunwind_2.patch
-    if [ $? -ne 0 ]; then
-      echo "[-] aarch64-libunwind_2 patch failed"
-      exit 1
-    fi
-  fi
-fi
-
-if [ "$ARCH" == "x86" ]; then
-  # Missing syscalls
-  patch -N --dry-run --silent src/x86/Gos-linux.c < ../patches/x86-libunwind.patch &>/dev/null
-  if [ $? -eq 0 ]; then
-    patch src/x86/Gos-linux.c < ../patches/x86-libunwind.patch
-    if [ $? -ne 0 ]; then
-      echo "[-] x86-libunwind patch failed"
-      exit 1
-    fi
-  fi
+else
+  echo "[-] Cannot apply libunwind patches"
+  abort 1
 fi
 
 # Support both Linux & Darwin
 HOST_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 HOST_ARCH=$(uname -m)
 
-SYSROOT="$NDK/platforms/android-21/arch-$ARCH"
+SYSROOT="$NDK/platforms/$ANDROID_API/arch-$ARCH"
 export CC="$NDK/toolchains/$TOOLCHAIN_S/prebuilt/$HOST_OS-$HOST_ARCH/bin/$TOOLCHAIN-gcc --sysroot=$SYSROOT"
 export CXX="$NDK/toolchains/$TOOLCHAIN_S/prebuilt/$HOST_OS-$HOST_ARCH/bin/$TOOLCHAIN-g++ --sysroot=$SYSROOT"
 export PATH="$NDK/toolchains/$TOOLCHAIN_S/prebuilt/$HOST_OS-$HOST_ARCH/bin":$PATH
 
 if [ ! -f configure ]; then
-  autoreconf -i
+  NOCONFIGURE=true ./autogen.sh
   if [ $? -ne 0 ]; then
-    echo "[-] autoreconf failed"
-    exit 1
+    echo "[-] autogen failed"
+    abort 1
   fi
   # Patch configure
   sed -i -e 's/-lgcc_s/-lgcc/g' configure
@@ -160,7 +182,7 @@ fi
 ./configure --host=$TOOLCHAIN --disable-coredump
 if [ $? -ne 0 ]; then
   echo "[-] configure failed"
-  exit 1
+  abort 1
 fi
 
 # Fix stuff that configure failed to detect
@@ -170,13 +192,27 @@ if [ "$ARCH" == "arm64" ]; then
   echo "#define HAVE_DECL_PT_GETREGSET 1" >> include/config.h
 fi
 
-make CFLAGS="$LC_CFLAGS" LDFLAGS="$LC_LDFLAGS"
+make -j"$JOBS" CFLAGS="$LC_CFLAGS" LDFLAGS="$LC_LDFLAGS"
 if [ $? -ne 0 ]; then
     echo "[-] Compilation failed"
     cd - &>/dev/null
-    exit 1
-else
-    echo "[*] '$ARCH' libunwind  available at '$LIBUNWIND_DIR/$ARCH'"
-    cp src/.libs/*.a $ARCH
-    cd - &>/dev/null
+    abort 1
 fi
+
+echo "[*] '$ARCH' libunwind available at '$LIBUNWIND_DIR/$ARCH'"
+cp src/.libs/*.a "$ARCH"
+echo "$ANDROID_API" > "$ARCH/android_api.txt"
+
+# Naming conventions for arm64
+if [[ "$ARCH" == "arm64" ]]; then
+  cd "$ARCH"
+  find . -type f -name "*aarch64*.a" | while read -r libFile
+  do
+    fName=$(basename "$libFile")
+    newFName=$(echo "$fName" | sed "s#aarch64#arm64#")
+    ln -sf "$fName" "$newFName"
+  done
+  cd -
+fi
+
+abort 0

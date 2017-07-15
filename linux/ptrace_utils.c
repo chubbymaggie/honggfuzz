@@ -21,7 +21,7 @@
  *
  */
 
-#include "common.h"
+#include "../libcommon/common.h"
 #include "ptrace_utils.h"
 
 #include <ctype.h>
@@ -38,7 +38,6 @@
 #include <sys/cdefs.h>
 #include <sys/personality.h>
 #include <sys/ptrace.h>
-#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -50,12 +49,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "files.h"
-#include "linux/bfd.h"
-#include "linux/unwind.h"
-#include "log.h"
-#include "sancov.h"
-#include "util.h"
+#include "../libcommon/files.h"
+#include "../libcommon/log.h"
+#include "../libcommon/util.h"
+#include "../sancov.h"
+#include "../subproc.h"
+#include "bfd.h"
+#include "unwind.h"
 
 #if defined(__ANDROID__)
 #include "capstone.h"
@@ -65,7 +65,7 @@
 #define REG_TYPE uint32_t
 #define REG_PM   PRIx32
 #define REG_PD   "0x%08"
-#elif defined(__x86_64__) || defined(__aarch64__) || defined(__powerpc64__)
+#elif defined(__x86_64__) || defined(__aarch64__) || defined(__powerpc64__) || defined(__mips__) || defined(__mips64__)
 #define REG_TYPE uint64_t
 #define REG_PM   PRIx64
 #define REG_PD   "0x%016"
@@ -82,6 +82,8 @@
 #elif defined(__arm__) || defined(__powerpc__) || defined(__powerpc64__)
 #define MAX_INSTR_SZ 4
 #elif defined(__aarch64__)
+#define MAX_INSTR_SZ 8
+#elif defined(__mips__) || defined(__mips64__)
 #define MAX_INSTR_SZ 8
 #endif
 
@@ -216,23 +218,21 @@ struct user_regs_struct_64 {
 };
 #endif                          /* defined(__powerpc64__) || defined(__powerpc__) */
 
+#if defined(__mips__) || defined(__mips64__)
+struct user_regs_struct {
+    uint64_t regs[32];
+
+    uint64_t lo;
+    uint64_t hi;
+    uint64_t cp0_epc;
+    uint64_t cp0_badvaddr;
+    uint64_t cp0_status;
+    uint64_t cp0_cause;
+};
+#define HEADERS_STRUCT struct user_regs_struct
+#endif                          /* defined(__mips__) || defined(__mips64__) */
+
 #if defined(__ANDROID__)
-#if defined(__NR_process_vm_readv)
-static ssize_t honggfuzz_process_vm_readv(pid_t pid,
-                                          const struct iovec *lvec,
-                                          unsigned long liovcnt,
-                                          const struct iovec *rvec,
-                                          unsigned long riovcnt, unsigned long flags)
-{
-    return syscall(__NR_process_vm_readv, (uintptr_t) pid, lvec, (uintptr_t) liovcnt, rvec,
-                   (uintptr_t) riovcnt, (uintptr_t) flags);
-}
-
-#define process_vm_readv honggfuzz_process_vm_readv
-#else                           /* defined(__NR_process_vm_readv) */
-#define process_vm_readv(...) (errno = ENOSYS, -1)
-#endif                          /* !defined(__NR_process_vm_readv) */
-
 /*
  * Some Android ABIs don't implement PTRACE_GETREGS (e.g. aarch64)
  */
@@ -244,12 +244,12 @@ static ssize_t honggfuzz_process_vm_readv(pid_t pid,
 #endif                          /* defined(__ANDROID__) */
 
 /*  *INDENT-OFF* */
-struct {
+static struct {
     const char *descr;
     bool important;
-} arch_sigs[NSIG] = {
-    [0 ... (NSIG - 1)].important = false,
-    [0 ... (NSIG - 1)].descr = "UNKNOWN",
+} arch_sigs[_NSIG + 1] = {
+    [0 ... (_NSIG)].important = false,
+    [0 ... (_NSIG)].descr = "UNKNOWN",
 
     [SIGTRAP].important = false,
     [SIGTRAP].descr = "SIGTRAP",
@@ -266,12 +266,17 @@ struct {
     [SIGBUS].important = true,
     [SIGBUS].descr = "SIGBUS",
 
-#if _HF_MONITOR_SIGABRT
-    [SIGABRT].important = true,
-#else
+    /* Is affected from monitorSIGABRT flag */
     [SIGABRT].important = false,
-#endif
-    [SIGABRT].descr = "SIGABRT"
+    [SIGABRT].descr = "SIGABRT",
+
+    /* Is affected from tmout_vtalrm flag */
+    [SIGVTALRM].important = false,
+    [SIGVTALRM].descr = "SIGVTALRM-TMOUT",
+
+    /* seccomp-bpf kill */
+    [SIGSYS].important = true,
+    [SIGSYS].descr = "SIGSYS",
 };
 /*  *INDENT-ON* */
 
@@ -279,22 +284,29 @@ struct {
 #define SI_FROMUSER(siptr)      ((siptr)->si_code <= 0)
 #endif                          /* SI_FROMUSER */
 
-static inline char *arch_sanCodeToStr(int exitCode)
+extern const char *sys_sigabbrev[];
+
+static __thread char arch_signame[32];
+static const char *arch_sigName(int signo)
 {
-    switch (exitCode) {
-    case HF_MSAN_EXIT_CODE:
-        return "MSAN";
-        break;
-    case HF_ASAN_EXIT_CODE:
-        return "ASAN";
-        break;
-    case HF_UBSAN_EXIT_CODE:
-        return "UBSAN";
-        break;
-    default:
-        return "UNKNW";
-        break;
+    if (signo < 0 || signo > _NSIG) {
+        snprintf(arch_signame, sizeof(arch_signame), "UNKNOWN-%d", signo);
+        return arch_signame;
     }
+    if (signo > __SIGRTMIN) {
+        snprintf(arch_signame, sizeof(arch_signame), "SIG%d-RTMIN+%d", signo, signo - __SIGRTMIN);
+        return arch_signame;
+    }
+#ifdef __ANDROID__
+    return arch_sigs[signo].descr;
+#else
+    if (sys_sigabbrev[signo] == NULL) {
+        snprintf(arch_signame, sizeof(arch_signame), "SIG%d", signo);
+    } else {
+        snprintf(arch_signame, sizeof(arch_signame), "SIG%s", sys_sigabbrev[signo]);
+    }
+    return arch_signame;
+#endif                          /* __ANDROID__ */
 }
 
 static size_t arch_getProcMem(pid_t pid, uint8_t * buf, size_t len, REG_TYPE pc)
@@ -338,56 +350,7 @@ static size_t arch_getProcMem(pid_t pid, uint8_t * buf, size_t len, REG_TYPE pc)
     return memsz;
 }
 
-void arch_ptraceGetCustomPerf(honggfuzz_t * hfuzz, pid_t pid UNUSED, uint64_t * cnt UNUSED)
-{
-    if ((hfuzz->dynFileMethod & _HF_DYNFILE_CUSTOM) == 0) {
-        return;
-    }
-#if defined(__i386__) || defined(__x86_64__)
-    HEADERS_STRUCT regs;
-    struct iovec pt_iov = {
-        .iov_base = &regs,
-        .iov_len = sizeof(regs),
-    };
-
-    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &pt_iov) == -1L) {
-        PLOG_D("ptrace(PTRACE_GETREGSET) failed");
-
-        // If PTRACE_GETREGSET fails, try PTRACE_GETREGS if available
-#if PTRACE_GETREGS_AVAILABLE
-        if (ptrace(PTRACE_GETREGS, pid, 0, &regs)) {
-            PLOG_D("ptrace(PTRACE_GETREGS) failed");
-            LOG_W("ptrace PTRACE_GETREGSET & PTRACE_GETREGS failed to extract target registers");
-            return;
-        }
-#else
-        return;
-#endif
-    }
-
-    /*
-     * 32-bit
-     */
-    if (pt_iov.iov_len == sizeof(struct user_regs_struct_32)) {
-        struct user_regs_struct_32 *r32 = (struct user_regs_struct_32 *)&regs;
-        *cnt = (uint64_t) r32->gs;
-        return;
-    }
-
-    /*
-     * 64-bit
-     */
-    if (pt_iov.iov_len == sizeof(struct user_regs_struct_64)) {
-        struct user_regs_struct_64 *r64 = (struct user_regs_struct_64 *)&regs;
-        *cnt = (uint64_t) r64->gs_base;
-        return;
-    }
-
-    LOG_W("Unknown registers structure size: '%zd'", pt_iov.iov_len);
-#endif                          /* defined(__i386__) || defined(__x86_64__) */
-}
-
-static size_t arch_getPC(pid_t pid, REG_TYPE * pc, REG_TYPE * status_reg)
+static size_t arch_getPC(pid_t pid, REG_TYPE * pc, REG_TYPE * status_reg UNUSED)
 {
     /*
      * Some old ARM android kernels are failing with PTRACE_GETREGS to extract
@@ -495,6 +458,11 @@ static size_t arch_getPC(pid_t pid, REG_TYPE * pc, REG_TYPE * status_reg)
     LOG_W("Unknown registers structure size: '%zd'", pt_iov.iov_len);
     return 0;
 #endif                          /* defined(__powerpc64__) || defined(__powerpc__) */
+
+#if defined(__mips__) || defined(__mips64__)
+    *pc = regs.cp0_epc;
+    return pt_iov.iov_len;
+#endif                          /* defined(__mips__) || defined(__mips64__) */
 
     LOG_D("Unknown/unsupported CPU architecture");
     return 0;
@@ -613,7 +581,7 @@ arch_ptraceGenerateReport(pid_t pid, fuzzer_t * fuzzer, funcs_t * funcs, size_t 
                    fuzzer->crashFileName);
     util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "PID: %d\n", pid);
     util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "SIGNAL: %s (%d)\n",
-                   arch_sigs[si->si_signo].descr, si->si_signo);
+                   arch_sigName(si->si_signo), si->si_signo);
     util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "FAULT ADDRESS: %p\n",
                    SI_FROMUSER(si) ? NULL : si->si_addr);
     util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "INSTRUCTION: %s\n", instr);
@@ -623,15 +591,16 @@ arch_ptraceGenerateReport(pid_t pid, fuzzer_t * fuzzer, funcs_t * funcs, size_t 
     for (size_t i = 0; i < funcCnt; i++) {
 #ifdef __HF_USE_CAPSTONE__
         util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), " <" REG_PD REG_PM "> ",
-                       (REG_TYPE) (long)funcs[i].pc, funcs[i].func, funcs[i].line);
+                       (REG_TYPE) (long)funcs[i].pc);
         if (funcs[i].func[0] != '\0')
-            util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "[%s + 0x%x]\n",
-                           funcs[i].func, funcs[i].line);
+            util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "[%s() + 0x%x at %s]\n",
+                           funcs[i].func, funcs[i].line, funcs[i].mapName);
         else
             util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "[]\n");
 #else
-        util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), " <" REG_PD REG_PM "> [%s():%u]\n",
-                       (REG_TYPE) (long)funcs[i].pc, funcs[i].func, funcs[i].line);
+        util_ssnprintf(fuzzer->report, sizeof(fuzzer->report),
+                       " <" REG_PD REG_PM "> [%s():%u at %s]\n", (REG_TYPE) (long)funcs[i].pc,
+                       funcs[i].func, funcs[i].line, funcs[i].mapName);
 #endif
     }
 
@@ -658,14 +627,11 @@ static void arch_ptraceAnalyzeData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * fu
     /*
      * Unwind and resolve symbols
      */
-    /*  *INDENT-OFF* */
-    funcs_t funcs[_HF_MAX_FUNCS] = {
-        [0 ... (_HF_MAX_FUNCS - 1)].pc = NULL,
-        [0 ... (_HF_MAX_FUNCS - 1)].line = 0,
-        [0 ... (_HF_MAX_FUNCS - 1)].func = {'\0'}
-        ,
+    funcs_t *funcs = util_Malloc(_HF_MAX_FUNCS * sizeof(funcs_t));
+    defer {
+        free(funcs);
     };
-    /*  *INDENT-ON* */
+    memset(funcs, 0, _HF_MAX_FUNCS * sizeof(funcs_t));
 
 #if !defined(__ANDROID__)
     size_t funcCnt = arch_unwindStack(pid, funcs);
@@ -681,7 +647,7 @@ static void arch_ptraceAnalyzeData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * fu
     if (funcCnt == 0) {
         if (pc) {
             /* Manually update major frame PC & frames counter */
-            funcs[0].pc = (void *)pc;
+            funcs[0].pc = (void *)(uintptr_t) pc;
             funcCnt = 1;
         } else {
             return;
@@ -716,21 +682,18 @@ static void arch_ptraceSaveData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * fuzze
 
     if (!SI_FROMUSER(&si) && pc && si.si_addr < hfuzz->linux.ignoreAddr) {
         LOG_I("'%s' is interesting (%s), but the si.si_addr is %p (below %p), skipping",
-              fuzzer->fileName, arch_sigs[si.si_signo].descr, si.si_addr, hfuzz->linux.ignoreAddr);
+              fuzzer->fileName, arch_sigName(si.si_signo), si.si_addr, hfuzz->linux.ignoreAddr);
         return;
     }
 
     /*
      * Unwind and resolve symbols
      */
-    /*  *INDENT-OFF* */
-    funcs_t funcs[_HF_MAX_FUNCS] = {
-        [0 ... (_HF_MAX_FUNCS - 1)].pc = NULL,
-        [0 ... (_HF_MAX_FUNCS - 1)].line = 0,
-        [0 ... (_HF_MAX_FUNCS - 1)].func = {'\0'}
-        ,
+    funcs_t *funcs = util_Malloc(_HF_MAX_FUNCS * sizeof(funcs_t));
+    defer {
+        free(funcs);
     };
-    /*  *INDENT-ON* */
+    memset(funcs, 0, _HF_MAX_FUNCS * sizeof(funcs_t));
 
 #if !defined(__ANDROID__)
     size_t funcCnt = arch_unwindStack(pid, funcs);
@@ -747,7 +710,7 @@ static void arch_ptraceSaveData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * fuzze
     if (funcCnt == 0) {
         if (pc) {
             /* Manually update major frame PC & frames counter */
-            funcs[0].pc = (void *)pc;
+            funcs[0].pc = (void *)(uintptr_t) pc;
             funcCnt = 1;
         } else {
             saveUnique = false;
@@ -802,13 +765,39 @@ static void arch_ptraceSaveData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * fuzze
     ATOMIC_POST_INC(hfuzz->crashesCnt);
 
     /*
-     * Check if stackhash is blacklisted
+     * Check if backtrace contains whitelisted symbol. Whitelist overrides
+     * both stackhash and symbol blacklist. Crash is always kept regardless
+     * of the status of uniqueness flag.
      */
-    if (hfuzz->blacklist
-        && (fastArray64Search(hfuzz->blacklist, hfuzz->blacklistCnt, fuzzer->backtrace) != -1)) {
-        LOG_I("Blacklisted stack hash '%" PRIx64 "', skipping", fuzzer->backtrace);
-        ATOMIC_POST_INC(hfuzz->blCrashesCnt);
-        return;
+    if (hfuzz->linux.symsWl) {
+        char *wlSymbol = arch_btContainsSymbol(hfuzz->linux.symsWlCnt, hfuzz->linux.symsWl,
+                                               funcCnt, funcs);
+        if (wlSymbol != NULL) {
+            saveUnique = false;
+            LOG_D("Whitelisted symbol '%s' found, skipping blacklist checks", wlSymbol);
+        }
+    } else {
+        /*
+         * Check if stackhash is blacklisted
+         */
+        if (hfuzz->blacklist
+            && (fastArray64Search(hfuzz->blacklist, hfuzz->blacklistCnt, fuzzer->backtrace) !=
+                -1)) {
+            LOG_I("Blacklisted stack hash '%" PRIx64 "', skipping", fuzzer->backtrace);
+            ATOMIC_POST_INC(hfuzz->blCrashesCnt);
+            return;
+        }
+
+        /*
+         * Check if backtrace contains blacklisted symbol
+         */
+        char *blSymbol = arch_btContainsSymbol(hfuzz->linux.symsBlCnt, hfuzz->linux.symsBl,
+                                               funcCnt, funcs);
+        if (blSymbol != NULL) {
+            LOG_I("Blacklisted symbol '%s' found, skipping", blSymbol);
+            ATOMIC_POST_INC(hfuzz->blCrashesCnt);
+            return;
+        }
     }
 
     /* If non-blacklisted crash detected, zero set two MSB */
@@ -832,14 +821,14 @@ static void arch_ptraceSaveData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * fuzze
     } else if (saveUnique) {
         snprintf(fuzzer->crashFileName, sizeof(fuzzer->crashFileName),
                  "%s/%s.PC.%" REG_PM ".STACK.%" PRIx64 ".CODE.%d.ADDR.%p.INSTR.%s.%s",
-                 hfuzz->workDir, arch_sigs[si.si_signo].descr, pc, fuzzer->backtrace,
+                 hfuzz->workDir, arch_sigName(si.si_signo), pc, fuzzer->backtrace,
                  si.si_code, sig_addr, instr, hfuzz->fileExtn);
     } else {
         char localtmstr[PATH_MAX];
         util_getLocalTime("%F.%H:%M:%S", localtmstr, sizeof(localtmstr), time(NULL));
         snprintf(fuzzer->crashFileName, sizeof(fuzzer->crashFileName),
                  "%s/%s.PC.%" REG_PM ".STACK.%" PRIx64 ".CODE.%d.ADDR.%p.INSTR.%s.%s.%d.%s",
-                 hfuzz->workDir, arch_sigs[si.si_signo].descr, pc, fuzzer->backtrace,
+                 hfuzz->workDir, arch_sigName(si.si_signo), pc, fuzzer->backtrace,
                  si.si_code, sig_addr, instr, localtmstr, pid, hfuzz->fileExtn);
     }
 
@@ -866,6 +855,7 @@ static void arch_ptraceSaveData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * fuzze
     arch_ptraceGenerateReport(pid, fuzzer, funcs, funcCnt, &si, instr);
 }
 
+/* TODO: Add report parsing support for other sanitizers too */
 static int arch_parseAsanReport(honggfuzz_t * hfuzz, pid_t pid, funcs_t * funcs, void **crashAddr,
                                 char **op)
 {
@@ -928,7 +918,7 @@ static int arch_parseAsanReport(honggfuzz_t * hfuzz, pid_t pid, funcs_t * funcs,
                 ++pLineLC;
             }
 
-            /* Separator for crash thread stack trace is an empty line (after trmming \n */
+            /* End separator for crash thread stack trace is an empty line */
             if ((*pLineLC == '\0') && (frameIdx != 0)) {
                 break;
             }
@@ -973,8 +963,9 @@ static int arch_parseAsanReport(honggfuzz_t * hfuzz, pid_t pid, funcs_t * funcs,
                 if ((startOff == NULL) || (endOff == NULL) || (plusOff == NULL)) {
                     LOG_D("Invalid ASan report entry (%s)", lineptr);
                 } else {
-                    size_t dsoSz = MIN(sizeof(funcs[frameIdx].func), (size_t) (plusOff - startOff));
-                    memcpy(funcs[frameIdx].func, startOff, dsoSz);
+                    size_t dsoSz =
+                        MIN(sizeof(funcs[frameIdx].mapName), (size_t) (plusOff - startOff));
+                    memcpy(funcs[frameIdx].mapName, startOff, dsoSz);
                     char *codeOff = targetStr + (plusOff - startOff) + 1;
                     funcs[frameIdx].line = strtoull(codeOff, NULL, 16);
                 }
@@ -993,7 +984,7 @@ static int arch_parseAsanReport(honggfuzz_t * hfuzz, pid_t pid, funcs_t * funcs,
  * a raised signal. Such case is the ASan fuzzing for Android. Crash file name maintains
  * the same format for compatibility with post campaign tools.
  */
-static void arch_ptraceExitSaveData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * fuzzer, int exitCode)
+static void arch_ptraceExitSaveData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * fuzzer)
 {
     REG_TYPE pc = 0;
     void *crashAddr = 0;
@@ -1017,59 +1008,49 @@ static void arch_ptraceExitSaveData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * f
         fuzzer->sanCovCnts.crashesCnt++;
     }
 
-    /* Get sanitizer string tag based on exitcode */
-    const char *sanStr = arch_sanCodeToStr(exitCode);
-
     /* If sanitizer produces reports with stack traces (e.g. ASan), they're parsed manually */
     int funcCnt = 0;
-
-    /*  *INDENT-OFF* */
-    funcs_t funcs[_HF_MAX_FUNCS] = {
-        [0 ... (_HF_MAX_FUNCS - 1)].pc = NULL,
-        [0 ... (_HF_MAX_FUNCS - 1)].line = 0,
-        [0 ... (_HF_MAX_FUNCS - 1)].func = {'\0'}
-        ,
+    funcs_t *funcs = util_Malloc(_HF_MAX_FUNCS * sizeof(funcs_t));
+    defer {
+        free(funcs);
     };
-    /*  *INDENT-ON* */
+    memset(funcs, 0, _HF_MAX_FUNCS * sizeof(funcs_t));
 
-    /* If ASan crash, parse report */
-    if (exitCode == HF_ASAN_EXIT_CODE) {
+    /* Sanitizers save reports against parent PID */
+    if (targetPid != pid) {
+        return;
+    }
+    funcCnt = arch_parseAsanReport(hfuzz, pid, funcs, &crashAddr, &op);
 
-        /* ASan is saving reports against parent PID */
-        if (targetPid != pid) {
-            return;
-        }
-        funcCnt = arch_parseAsanReport(hfuzz, pid, funcs, &crashAddr, &op);
+    /*
+     * -1 error indicates a file not found for report. This is expected to happen often since
+     * ASan report is generated once for crashing TID. Ptrace arch is not guaranteed to parse
+     * that TID first. Not setting the 'crashFileName' variable will ensure that this branch
+     * is executed again for all TIDs until the matching report is found
+     */
+    if (funcCnt == -1) {
+        return;
+    }
 
-        /*
-         * -1 error indicates a file not found for report. This is expected to happen often since
-         * ASan report is generated once for crashing TID. Ptrace arch is not guaranteed to parse
-         * that TID first. Not setting the 'crashFileName' variable will ensure that this branch
-         * is executed again for all TIDs until the matching report is found
-         */
-        if (funcCnt == -1) {
-            return;
-        }
+    /* Since crash address is available, apply ignoreAddr filters */
+    if (crashAddr < hfuzz->linux.ignoreAddr) {
+        LOG_I("'%s' is interesting, but the crash addr is %p (below %p), skipping",
+              fuzzer->fileName, crashAddr, hfuzz->linux.ignoreAddr);
+        return;
+    }
 
-        /* Since crash address is available, apply ignoreAddr filters */
-        if (crashAddr < hfuzz->linux.ignoreAddr) {
-            LOG_I("'%s' is interesting, but the crash addr is %p (below %p), skipping",
-                  fuzzer->fileName, crashAddr, hfuzz->linux.ignoreAddr);
-            return;
-        }
+    /* If frames successfully recovered, calculate stack hash & populate crash PC */
+    arch_hashCallstack(hfuzz, fuzzer, funcs, funcCnt, false);
+    pc = (uintptr_t) funcs[0].pc;
 
-        /* If frames successfully recovered, calculate stack hash & populate crash PC */
-        arch_hashCallstack(hfuzz, fuzzer, funcs, funcCnt, false);
-        pc = (uintptr_t) funcs[0].pc;
-
-        /* Since stack hash is available apply blacklist filters */
-        if (hfuzz->blacklist
-            && (fastArray64Search(hfuzz->blacklist, hfuzz->blacklistCnt, fuzzer->backtrace) !=
-                -1)) {
-            LOG_I("Blacklisted stack hash '%" PRIx64 "', skipping", fuzzer->backtrace);
-            ATOMIC_POST_INC(hfuzz->blCrashesCnt);
-            return;
-        }
+    /*
+     * Check if stackhash is blacklisted
+     */
+    if (hfuzz->blacklist
+        && (fastArray64Search(hfuzz->blacklist, hfuzz->blacklistCnt, fuzzer->backtrace) != -1)) {
+        LOG_I("Blacklisted stack hash '%" PRIx64 "', skipping", fuzzer->backtrace);
+        ATOMIC_POST_INC(hfuzz->blCrashesCnt);
+        return;
     }
 
     /* If dry run mode, copy file with same name into workspace */
@@ -1081,7 +1062,7 @@ static void arch_ptraceExitSaveData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * f
         if (fuzzer->backtrace != 0ULL && hfuzz->saveUnique) {
             snprintf(fuzzer->crashFileName, sizeof(fuzzer->crashFileName),
                      "%s/%s.PC.%" REG_PM ".STACK.%" PRIx64 ".CODE.%s.ADDR.%p.INSTR.%s.%s",
-                     hfuzz->workDir, sanStr, pc, fuzzer->backtrace,
+                     hfuzz->workDir, "SAN", pc, fuzzer->backtrace,
                      op, crashAddr, "[UNKNOWN]", hfuzz->fileExtn);
         } else {
             /* If no stack hash available, all crashes treated as unique */
@@ -1089,13 +1070,14 @@ static void arch_ptraceExitSaveData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * f
             util_getLocalTime("%F.%H:%M:%S", localtmstr, sizeof(localtmstr), time(NULL));
             snprintf(fuzzer->crashFileName, sizeof(fuzzer->crashFileName),
                      "%s/%s.PC.%" REG_PM ".STACK.%" PRIx64 ".CODE.%s.ADDR.%p.INSTR.%s.%s.%s",
-                     hfuzz->workDir, sanStr, pc, fuzzer->backtrace,
+                     hfuzz->workDir, "SAN", pc, fuzzer->backtrace,
                      op, crashAddr, "[UNKNOWN]", localtmstr, hfuzz->fileExtn);
         }
     }
 
     bool dstFileExists = false;
-    if (files_copyFile(fuzzer->fileName, fuzzer->crashFileName, &dstFileExists)) {
+    if (files_copyFile
+        (fuzzer->fileName, fuzzer->crashFileName, &dstFileExists, true /* try_link */ )) {
         LOG_I("Ok, that's interesting, saved '%s' as '%s'", fuzzer->fileName,
               fuzzer->crashFileName);
 
@@ -1121,13 +1103,12 @@ static void arch_ptraceExitSaveData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * f
 
     /* Generate report */
     fuzzer->report[0] = '\0';
+    util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "EXIT_CODE: %s\n", HF_SAN_EXIT_CODE);
     util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "ORIG_FNAME: %s\n",
                    fuzzer->origFileName);
     util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "FUZZ_FNAME: %s\n",
                    fuzzer->crashFileName);
     util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "PID: %d\n", pid);
-    util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "EXIT CODE: %d (%s)\n", exitCode,
-                   sanStr);
     util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "OPERATION: %s\n", op);
     util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "FAULT ADDRESS: %p\n", crashAddr);
     if (funcCnt > 0) {
@@ -1136,10 +1117,10 @@ static void arch_ptraceExitSaveData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * f
         util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "STACK:\n");
         for (int i = 0; i < funcCnt; i++) {
             util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), " <" REG_PD REG_PM "> ",
-                           (REG_TYPE) (long)funcs[i].pc, funcs[i].func, funcs[i].line);
-            if (funcs[i].func[0] != '\0') {
+                           (REG_TYPE) (long)funcs[i].pc);
+            if (funcs[i].mapName[0] != '\0') {
                 util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "[%s + 0x%x]\n",
-                               funcs[i].func, funcs[i].line);
+                               funcs[i].mapName, funcs[i].line);
             } else {
                 util_ssnprintf(fuzzer->report, sizeof(fuzzer->report), "[]\n");
             }
@@ -1147,26 +1128,16 @@ static void arch_ptraceExitSaveData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * f
     }
 }
 
-static void arch_ptraceExitAnalyzeData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * fuzzer,
-                                       int exitCode)
+static void arch_ptraceExitAnalyzeData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * fuzzer)
 {
-    /* Stack traces from reports available only with Address Sanitizer */
-    if (exitCode != HF_ASAN_EXIT_CODE) {
-        return;
-    }
-
     void *crashAddr = 0;
     char *op = "UNKNOWN";
     int funcCnt = 0;
-
-    /*  *INDENT-OFF* */
-    funcs_t funcs[_HF_MAX_FUNCS] = {
-        [0 ... (_HF_MAX_FUNCS - 1)].pc = NULL,
-        [0 ... (_HF_MAX_FUNCS - 1)].line = 0,
-        [0 ... (_HF_MAX_FUNCS - 1)].func = {'\0'}
-        ,
+    funcs_t *funcs = util_Malloc(_HF_MAX_FUNCS * sizeof(funcs_t));
+    defer {
+        free(funcs);
     };
-    /*  *INDENT-ON* */
+    memset(funcs, 0, _HF_MAX_FUNCS * sizeof(funcs_t));
 
     funcCnt = arch_parseAsanReport(hfuzz, pid, funcs, &crashAddr, &op);
 
@@ -1184,14 +1155,14 @@ static void arch_ptraceExitAnalyzeData(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t 
     arch_hashCallstack(hfuzz, fuzzer, funcs, funcCnt, false);
 }
 
-void arch_ptraceExitAnalyze(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * fuzzer, int exitCode)
+void arch_ptraceExitAnalyze(honggfuzz_t * hfuzz, pid_t pid, fuzzer_t * fuzzer)
 {
     if (fuzzer->mainWorker) {
         /* Main fuzzing threads */
-        arch_ptraceExitSaveData(hfuzz, pid, fuzzer, exitCode);
+        arch_ptraceExitSaveData(hfuzz, pid, fuzzer);
     } else {
         /* Post crash analysis (e.g. crashes verifier) */
-        arch_ptraceExitAnalyzeData(hfuzz, pid, fuzzer, exitCode);
+        arch_ptraceExitAnalyzeData(hfuzz, pid, fuzzer);
     }
 }
 
@@ -1211,10 +1182,8 @@ static void arch_ptraceEvent(honggfuzz_t * hfuzz, fuzzer_t * fuzzer, int status,
             if (WIFEXITED(event_msg)) {
                 LOG_D("PID: %d exited with exit_code: %lu", pid,
                       (unsigned long)WEXITSTATUS(event_msg));
-                if ((WEXITSTATUS(event_msg) == (unsigned long)HF_MSAN_EXIT_CODE) ||
-                    (WEXITSTATUS(event_msg) == (unsigned long)HF_ASAN_EXIT_CODE) ||
-                    (WEXITSTATUS(event_msg) == (unsigned long)HF_UBSAN_EXIT_CODE)) {
-                    arch_ptraceExitAnalyze(hfuzz, pid, fuzzer, WEXITSTATUS(event_msg));
+                if (WEXITSTATUS(event_msg) == (unsigned long)HF_SAN_EXIT_CODE) {
+                    arch_ptraceExitAnalyze(hfuzz, pid, fuzzer);
                 }
             } else if (WIFSIGNALED(event_msg)) {
                 LOG_D("PID: %d terminated with signal: %lu", pid,
@@ -1255,7 +1224,9 @@ void arch_ptraceAnalyze(honggfuzz_t * hfuzz, int status, pid_t pid, fuzzer_t * f
                 arch_ptraceAnalyzeData(hfuzz, pid, fuzzer);
             }
         }
-        ptrace(PTRACE_CONT, pid, 0, WSTOPSIG(status));
+        /* Do not deliver SIGSTOP, as we don't support PTRACE_LISTEN anyway */
+        int sig = (WSTOPSIG(status) != SIGSTOP) ? WSTOPSIG(status) : 0;
+        ptrace(PTRACE_CONT, pid, 0, sig);
         return;
     }
 
@@ -1273,10 +1244,8 @@ void arch_ptraceAnalyze(honggfuzz_t * hfuzz, int status, pid_t pid, fuzzer_t * f
         /*
          * Target exited with sanitizer defined exitcode (used when SIGABRT is not monitored)
          */
-        if ((WEXITSTATUS(status) == HF_MSAN_EXIT_CODE) ||
-            (WEXITSTATUS(status) == HF_ASAN_EXIT_CODE) ||
-            (WEXITSTATUS(status) == HF_UBSAN_EXIT_CODE)) {
-            arch_ptraceExitAnalyze(hfuzz, pid, fuzzer, WEXITSTATUS(status));
+        if (WEXITSTATUS(status) == (unsigned long)HF_SAN_EXIT_CODE) {
+            arch_ptraceExitAnalyze(hfuzz, pid, fuzzer);
         }
         return;
     }
@@ -1314,8 +1283,9 @@ static bool arch_listThreads(int tasks[], size_t thrSz, int pid)
     };
 
     for (;;) {
-        struct dirent de, *res;
-        if (readdir_r(dir, &de, &res) > 0) {
+        errno = 0;
+        struct dirent *res = readdir(dir);
+        if (res == NULL && errno != 0) {
             PLOG_E("Couldn't read contents of '%s'", path);
             return false;
         }
@@ -1366,10 +1336,20 @@ bool arch_ptraceWaitForPidStop(pid_t pid)
 }
 
 #define MAX_THREAD_IN_TASK 4096
-bool arch_ptraceAttach(pid_t pid)
+bool arch_ptraceAttach(honggfuzz_t * hfuzz, pid_t pid)
 {
-    static const long seize_options =
-        PTRACE_O_TRACECLONE | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXIT;
+    long seize_options = PTRACE_O_TRACECLONE | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK;
+    if (hfuzz->linux.pid == 0) {
+        seize_options |= PTRACE_O_EXITKILL;
+    }
+    /* The event is only used with sanitizers */
+    if (hfuzz->enableSanitizers) {
+        seize_options |= PTRACE_O_TRACEEXIT;
+    }
+
+    if (hfuzz->linux.pid == 0 && arch_ptraceWaitForPidStop(pid) == false) {
+        return false;
+    }
 
     if (ptrace(PTRACE_SEIZE, pid, NULL, seize_options) == -1) {
         PLOG_W("Couldn't ptrace(PTRACE_SEIZE) to pid: %d", pid);
@@ -1377,6 +1357,11 @@ bool arch_ptraceAttach(pid_t pid)
     }
 
     LOG_D("Attached to PID: %d", pid);
+
+    /* It only makes sense to attach to threads with -p */
+    if (hfuzz->linux.pid == 0) {
+        return true;
+    }
 
     int tasks[MAX_THREAD_IN_TASK + 1] = { 0 };
     if (!arch_listThreads(tasks, MAX_THREAD_IN_TASK, pid)) {
@@ -1415,4 +1400,13 @@ void arch_ptraceDetach(pid_t pid)
         arch_ptraceWaitForPidStop(tasks[i]);
         ptrace(PTRACE_DETACH, tasks[i], NULL, NULL);
     }
+}
+
+void arch_ptraceSignalsInit(honggfuzz_t * hfuzz)
+{
+    /* Default is true for all platforms except Android */
+    arch_sigs[SIGABRT].important = hfuzz->monitorSIGABRT;
+
+    /* Default is false */
+    arch_sigs[SIGVTALRM].important = hfuzz->tmout_vtalrm;
 }

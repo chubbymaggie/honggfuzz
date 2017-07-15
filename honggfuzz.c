@@ -32,13 +32,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "common.h"
+#include "libcommon/common.h"
+#include "libcommon/log.h"
+#include "libcommon/files.h"
+#include "libcommon/util.h"
 #include "cmdline.h"
 #include "display.h"
-#include "log.h"
-#include "files.h"
 #include "fuzz.h"
-#include "util.h"
 
 static int sigReceived = 0;
 
@@ -55,7 +55,14 @@ void sigHandler(int sig)
         return;
     }
 
-    sigReceived = sig;
+    if (ATOMIC_GET(sigReceived) != 0) {
+        static const char *const sigMsg = "Repeated termination signal caugth\n";
+        if (write(STDERR_FILENO, sigMsg, strlen(sigMsg) + 1) == -1) {
+        };
+        _exit(EXIT_FAILURE);
+    }
+
+    ATOMIC_SET(sigReceived, sig);
 }
 
 static void setupTimer(void)
@@ -71,13 +78,16 @@ static void setupTimer(void)
 
 static void setupSignalsPreThr(void)
 {
-    /* Block signals which should be handled by the main thread */
+    /* Block signals which should be handled or blocked in the main thread */
     sigset_t ss;
     sigemptyset(&ss);
     sigaddset(&ss, SIGTERM);
     sigaddset(&ss, SIGINT);
     sigaddset(&ss, SIGQUIT);
     sigaddset(&ss, SIGALRM);
+    sigaddset(&ss, SIGPIPE);
+    sigaddset(&ss, SIGIO);
+    sigaddset(&ss, SIGCHLD);
     if (sigprocmask(SIG_BLOCK, &ss, NULL) != 0) {
         PLOG_F("pthread_sigmask(SIG_BLOCK)");
     }
@@ -134,9 +144,19 @@ int main(int argc, char **argv)
         LOG_F("Parsing of the cmd-line arguments failed");
     }
 
+    if (hfuzz.useScreen) {
+        display_init();
+    }
+
     if (!files_init(&hfuzz)) {
-        LOG_F("Couldn't load input files");
-        exit(EXIT_FAILURE);
+        if (hfuzz.externalCommand) {
+            LOG_I
+                ("No input file corpus loaded, the external command '%s' is responsible for creating the fuzz files",
+                 hfuzz.externalCommand);
+        } else {
+            LOG_F("Couldn't load input files");
+            exit(EXIT_FAILURE);
+        }
     }
 
     if (hfuzz.dictionaryFile && (files_parseDictionary(&hfuzz) == false)) {
@@ -146,12 +166,31 @@ int main(int argc, char **argv)
     if (hfuzz.blacklistFile && (files_parseBlacklist(&hfuzz) == false)) {
         LOG_F("Couldn't parse stackhash blacklist file ('%s')", hfuzz.blacklistFile);
     }
+#define hfuzzl hfuzz.linux
+    if (hfuzzl.symsBlFile &&
+        ((hfuzzl.symsBlCnt = files_parseSymbolFilter(hfuzzl.symsBlFile, &hfuzzl.symsBl)) == 0)) {
+        LOG_F("Couldn't parse symbols blacklist file ('%s')", hfuzzl.symsBlFile);
+    }
+
+    if (hfuzzl.symsWlFile &&
+        ((hfuzzl.symsWlCnt = files_parseSymbolFilter(hfuzzl.symsWlFile, &hfuzzl.symsWl)) == 0)) {
+        LOG_F("Couldn't parse symbols whitelist file ('%s')", hfuzzl.symsWlFile);
+    }
+
+    if (hfuzz.dynFileMethod != _HF_DYNFILE_NONE) {
+        hfuzz.feedback = files_mapSharedMem(sizeof(feedback_t), &hfuzz.bbFd, hfuzz.workDir);
+        if (hfuzz.feedback == MAP_FAILED) {
+            LOG_F("files_mapSharedMem(sz=%zu, dir='%s') failed", sizeof(feedback_t), hfuzz.workDir);
+        }
+    }
 
     /*
-     * So far so good
+     * So far, so good
      */
+    pthread_t threads[hfuzz.threadsMax];
+
     setupSignalsPreThr();
-    fuzz_threads(&hfuzz);
+    fuzz_threadsStart(&hfuzz, threads);
     setupSignalsPostThr();
 
     setupTimer();
@@ -159,29 +198,35 @@ int main(int argc, char **argv)
         if (hfuzz.useScreen) {
             display_display(&hfuzz);
         }
-        if (sigReceived > 0) {
+        if (ATOMIC_GET(sigReceived) > 0) {
+            LOG_I("Signal %d (%s) received, terminating", ATOMIC_GET(sigReceived),
+                  strsignal(ATOMIC_GET(sigReceived)));
             break;
         }
         if (ATOMIC_GET(hfuzz.threadsFinished) >= hfuzz.threadsMax) {
             break;
         }
+        if (hfuzz.runEndTime > 0 && (time(NULL) > hfuzz.runEndTime)) {
+            LOG_I("Maximum run time reached, terminating");
+            ATOMIC_SET(hfuzz.terminating, true);
+            break;
+        }
         pause();
     }
 
-    if (sigReceived > 0) {
-        LOG_I("Signal %d (%s) received, terminating", sigReceived, strsignal(sigReceived));
-    }
+    ATOMIC_SET(hfuzz.terminating, true);
+
+    fuzz_threadsStop(&hfuzz, threads);
 
     /* Clean-up global buffers */
-    free(hfuzz.files);
-    if (hfuzz.dictionary) {
-        for (size_t i = 0; i < hfuzz.dictionaryCnt; i++) {
-            free(hfuzz.dictionary[i]);
-        }
-        free(hfuzz.dictionary);
-    }
     if (hfuzz.blacklist) {
         free(hfuzz.blacklist);
+    }
+    if (hfuzz.linux.symsBl) {
+        free(hfuzz.linux.symsBl);
+    }
+    if (hfuzz.linux.symsWl) {
+        free(hfuzz.linux.symsWl);
     }
     if (hfuzz.sanOpts.asanOpts) {
         free(hfuzz.sanOpts.asanOpts);

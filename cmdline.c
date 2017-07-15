@@ -27,16 +27,20 @@
 #include <getopt.h>
 #include <inttypes.h>
 #include <limits.h>
+#if defined(_HF_ARCH_LINUX)
+#include <sched.h>
+#endif                          /* defined(_HF_ARCH_LINUX) */
+#include <signal.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/queue.h>
 #include <unistd.h>
 
-#include "common.h"
-#include "log.h"
-#include "files.h"
-#include "util.h"
+#include "libcommon/common.h"
+#include "libcommon/log.h"
+#include "libcommon/files.h"
+#include "libcommon/util.h"
 
 struct custom_option {
     struct option opt;
@@ -79,6 +83,13 @@ static void cmdlineHelp(const char *pname, struct custom_option *opts)
     LOG_HELP_BOLD("  " PROG_NAME " -f input_dir -s -- /usr/bin/djpeg");
     LOG_HELP(" Use SANCOV to maximize code coverage:");
     LOG_HELP_BOLD("  " PROG_NAME " -f input_dir -C -- /usr/bin/tiffinfo -D " _HF_FILE_PLACEHOLDER);
+    LOG_HELP(" Use compile-time instrumentation (libhfuzz/instrument.c):");
+    LOG_HELP_BOLD("  " PROG_NAME " -f input_dir -z -- /usr/bin/tiffinfo -D " _HF_FILE_PLACEHOLDER);
+    LOG_HELP(" Use persistent mode (libhfuzz/persistent.c):");
+    LOG_HELP_BOLD("  " PROG_NAME " -f input_dir -P -- /usr/bin/tiffinfo_persistent");
+    LOG_HELP
+        (" Use persistent mode (libhfuzz/persistent.c) and compile-time instrumentation (libhfuzz/instrument.c):");
+    LOG_HELP_BOLD("  " PROG_NAME " -f input_dir -P -z -- /usr/bin/tiffinfo_persistent");
 #if defined(_HF_ARCH_LINUX)
     LOG_HELP(" Run the binary over a dynamic file, maximize total no. of instructions:");
     LOG_HELP_BOLD("  " PROG_NAME " --linux_perf_instr -- /usr/bin/tiffinfo -D "
@@ -86,13 +97,12 @@ static void cmdlineHelp(const char *pname, struct custom_option *opts)
     LOG_HELP(" Run the binary over a dynamic file, maximize total no. of branches:");
     LOG_HELP_BOLD("  " PROG_NAME " --linux_perf_branch -- /usr/bin/tiffinfo -D "
                   _HF_FILE_PLACEHOLDER);
-    LOG_HELP(" Run the binary over a dynamic file, maximize unique code blocks (coverage):");
-    LOG_HELP_BOLD("  " PROG_NAME " --linux_perf_ip -- /usr/bin/tiffinfo -D " _HF_FILE_PLACEHOLDER);
-    LOG_HELP(" Run the binary over a dynamic file, maximize unique branches (edges):");
-    LOG_HELP_BOLD("  " PROG_NAME " --linux_perf_ip_addr -- /usr/bin/tiffinfo -D "
+    LOG_HELP(" Run the binary over a dynamic file, maximize unique branches (edges) via BTS:");
+    LOG_HELP_BOLD("  " PROG_NAME " --linux_perf_bts_edge -- /usr/bin/tiffinfo -D "
                   _HF_FILE_PLACEHOLDER);
-    LOG_HELP(" Run the binary over a dynamic file, maximize custom counters (experimental):");
-    LOG_HELP_BOLD("  " PROG_NAME " --linux_perf_custom -- /usr/bin/tiffinfo -D "
+    LOG_HELP
+        (" Run the binary over a dynamic file, maximize unique code blocks via Intel Processor Trace (requires libipt.so):");
+    LOG_HELP_BOLD("  " PROG_NAME " --linux_perf_ipt_block -- /usr/bin/tiffinfo -D "
                   _HF_FILE_PLACEHOLDER);
 #endif                          /* defined(_HF_ARCH_LINUX) */
 }
@@ -131,8 +141,11 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
     (*hfuzz) = (honggfuzz_t) {
         .cmdline = NULL,
         .cmdline_txt[0] = '\0',
-        .inputFile = NULL,
-        .nullifyStdio = false,
+        .inputDir = NULL,
+        .inputDirP = NULL,
+        .fileCnt = 0,
+        .fileCntDone = false,
+        .nullifyStdio = true,
         .fuzzStdin = false,
         .saveUnique = true,
         .useScreen = true,
@@ -140,37 +153,52 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
         .timeStart = time(NULL),
         .fileExtn = "fuzz",
         .workDir = ".",
+        .covDir = NULL,
         .origFlipRate = 0.001f,
         .externalCommand = NULL,
-        .dictionaryFile = NULL,
-        .dictionary = NULL,
-        .dictionaryCnt = 0,
+        .postExternalCommand = NULL,
         .blacklistFile = NULL,
         .blacklistCnt = 0,
         .blacklist = NULL,
-        .maxFileSz = (1024 * 1024),
+        .maxFileSz = 0UL,
         .tmOut = 10,
+        .runEndTime = 0,
         .mutationsMax = 0,
         .threadsFinished = 0,
-        .threadsMax = 2,
+        .threadsMax = (sysconf(_SC_NPROCESSORS_ONLN) <= 1) ? 1 : sysconf(_SC_NPROCESSORS_ONLN) / 2,
         .reportFile = NULL,
         .asLimit = 0ULL,
-        .files = NULL,
-        .fileCnt = 0,
-        .lastFileIndex = 0,
-        .doneFileIndex = 0,
-        .exeFd = -1,
         .clearEnv = false,
         .envs = {
             [0 ... (ARRAYSIZE(hfuzz->envs) - 1)] = NULL,
         },
         .persistent = false,
+        .tmout_vtalrm = false,
+        .skipFeedbackOnTimeout = false,
+        .enableSanitizers = false,
+#if defined(__ANDROID__)
+        .monitorSIGABRT = false,
+#else
+        .monitorSIGABRT = true,
+#endif
+        .threadsActiveCnt = 0,
+        .mainPid = getpid(),
+        .terminating = false,
+        .exitUponCrash = false,
+
+        .dictionaryFile = NULL,
+        .dictionaryCnt = 0,
+        .dictqCurrent = NULL,
 
         .state = _HF_STATE_UNSET,
-        .bbMapSz = _HF_PERF_BITMAP_SIZE,
-        .bbMap = NULL,
+        .feedback = NULL,
+        .bbFd = -1,
+
         .dynfileq_mutex = PTHREAD_MUTEX_INITIALIZER,
         .dynfileqCnt = 0U,
+        .dynfileqCurrent = NULL,
+
+        .feedback_mutex = PTHREAD_MUTEX_INITIALIZER,
 
         .mutationsCnt = 0,
         .crashesCnt = 0,
@@ -197,18 +225,19 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
         },
         .useSanCov = false,
         .covMetadata = NULL,
-        .msanReportUMRS = false,
 
         .report_mutex = PTHREAD_MUTEX_INITIALIZER,
 
         /* Linux code */
         .linux = {
+            .exeFd = -1,
             .hwCnts = {
                 .cpuInstrCnt = 0ULL,
                 .cpuBranchCnt = 0ULL,
-                .customCnt = 0ULL,
                 .bbCnt = 0ULL,
                 .newBBCnt = 0ULL,
+                .softCntPc = 0ULL,
+                .softCntCmp = 0ULL,
             },
             .dynamicCutOffAddr = ~(0ULL),
             .disableRandomization = true,
@@ -217,19 +246,32 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
             .pid = 0,
             .pidFile = NULL,
             .pidCmd = NULL,
+            .symsBlFile = NULL,
+            .symsBlCnt = 0,
+            .symsBl = NULL,
+            .symsWlFile = NULL,
+            .symsWlCnt = 0,
+            .symsWl = NULL,
+            .cloneFlags = 0,
+            .kernelOnly = false,
+            .useClone = true,
         },
     };
     /*  *INDENT-ON* */
 
     TAILQ_INIT(&hfuzz->dynfileq);
+    TAILQ_INIT(&hfuzz->dictq);
 
     /*  *INDENT-OFF* */
     struct custom_option custom_opts[] = {
         {{"help", no_argument, NULL, 'h'}, "Help plz.."},
-        {{"input", required_argument, NULL, 'f'}, "Path to the file corpus (file or a directory)"},
-        {{"nullify_stdio", no_argument, NULL, 'q'}, "Null-ify children's stdin, stdout, stderr; make them quiet"},
+        {{"input", required_argument, NULL, 'f'}, "Path to a directory containing initial file corpus"},
+        {{"persistent", no_argument, NULL, 'P'}, "Enable persistent fuzzing (use hfuzz_cc/hfuzz-clang to compile code)"},
+        {{"instrument", no_argument, NULL, 'z'}, "Enable compile-time instrumentation (use hfuzz_cc/hfuzz-clang to compile code)"},
+        {{"sancov", no_argument, NULL, 'C'}, "Enable sanitizer coverage feedback"},
+        {{"keep_output", no_argument, NULL, 'Q'}, "Don't close children's stdin, stdout, stderr; can be noisy"},
         {{"timeout", required_argument, NULL, 't'}, "Timeout in seconds (default: '10')"},
-        {{"threads", required_argument, NULL, 'n'}, "Number of concurrent fuzzing threads (default: '2')"},
+        {{"threads", required_argument, NULL, 'n'}, "Number of concurrent fuzzing threads (default: number of CPUs / 2)"},
         {{"stdin_input", no_argument, NULL, 's'}, "Provide fuzzing input on STDIN, instead of ___FILE___"},
         {{"mutation_rate", required_argument, NULL, 'r'}, "Maximal mutation rate in relation to the file size, (default: '0.001')"},
         {{"logfile", required_argument, NULL, 'l'}, "Log file"},
@@ -238,9 +280,12 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
         {{"debug_level", required_argument, NULL, 'd'}, "Debug level (0 - FATAL ... 4 - DEBUG), (default: '3' [INFO])"},
         {{"extension", required_argument, NULL, 'e'}, "Input file extension (e.g. 'swf'), (default: 'fuzz')"},
         {{"workspace", required_argument, NULL, 'W'}, "Workspace directory to save crashes & runtime files (default: '.')"},
-        {{"wordlist", required_argument, NULL, 'w'}, "Wordlist file (tokens delimited by NUL-bytes)"},
+        {{"covdir", required_argument, NULL, 0x103}, "New coverage is written to a separate directory (default: use the input directory)"},
+        {{"dict", required_argument, NULL, 'w'}, "Dictionary file. Format:http://llvm.org/docs/LibFuzzer.html#dictionaries"},
         {{"stackhash_bl", required_argument, NULL, 'B'}, "Stackhashes blacklist file (one entry per line)"},
-        {{"mutate_cmd", required_argument, NULL, 'c'}, "External command providing fuzz files, instead of mutating the input corpus"},
+        {{"mutate_cmd", required_argument, NULL, 'c'}, "External command producing fuzz files (instead of internal mutators)"},
+        {{"pprocess_cmd", required_argument, NULL, 0x104}, "External command postprocessing files produced by internal mutators"},
+        {{"run_time", required_argument, NULL, 0x109}, "Number of seconds this fuzzing session will last (default: '0' [no limit])"},
         {{"iterations", required_argument, NULL, 'N'}, "Number of fuzzing iterations (default: '0' [no limit])"},
         {{"rlimit_as", required_argument, NULL, 0x100}, "Per process memory limit in MiB (default: '0' [no limit])"},
         {{"report", required_argument, NULL, 'R'}, "Write report to this file (default: '" _HF_REPORT_FILE "')"},
@@ -248,11 +293,15 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
         {{"clear_env", no_argument, NULL, 0x101}, "Clear all environment variables before executing the binary"},
         {{"env", required_argument, NULL, 'E'}, "Pass this environment variable, can be used multiple times"},
         {{"save_all", no_argument, NULL, 'u'}, "Save all test-cases (not only the unique ones) by appending the current time-stamp to the filenames"},
-        {{"sancov", no_argument, NULL, 'C'}, "Enable sanitizer coverage feedback"},
-        {{"msan_report_umrs", no_argument, NULL, 0x102}, "Report MSAN's UMRS (uninitialized memory access)"},
-        {{"persistent", no_argument, NULL, 'P'}, "Enable persistent fuzzing (link with libraries/persistent.mode.main.o)"},
+        {{"tmout_sigvtalrm", no_argument, NULL, 'T'}, "Use SIGVTALRM to kill timeouting processes (default: use SIGKILL)"},
+        {{"sanitizers", no_argument, NULL, 'S'}, "Enable sanitizers settings (default: false)"},
+        {{"monitor_sigabrt", required_argument, NULL, 0x105}, "Monitor SIGABRT (default: 'false for Android - 'true for other platforms)"},
+        {{"no_fb_timeout", required_argument, NULL, 0x106}, "Skip feedback if the process has timeouted (default: 'false')"},
+        {{"exit_upon_crash", no_argument, NULL, 0x107}, "Exit upon seeing the first crash (default: 'false')"},
 
 #if defined(_HF_ARCH_LINUX)
+        {{"linux_symbols_bl", required_argument, NULL, 0x504}, "Symbols blacklist filter file (one entry per line)"},
+        {{"linux_symbols_wl", required_argument, NULL, 0x505}, "Symbols whitelist filter file (one entry per line)"},
         {{"linux_pid", required_argument, NULL, 'p'}, "Attach to a pid (and its thread group)"},
         {{"linux_file_pid", required_argument, NULL, 0x502}, "Attach to pid (and its thread group) read from file"},
         {{"linux_addr_low_limit", required_argument, NULL, 0x500}, "Address limit (from si.si_addr) below which crashes are not reported, (default: '0')"},
@@ -260,10 +309,12 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
         {{"linux_perf_ignore_above", required_argument, NULL, 0x503}, "Ignore perf events which report IPs above this address"},
         {{"linux_perf_instr", no_argument, NULL, 0x510}, "Use PERF_COUNT_HW_INSTRUCTIONS perf"},
         {{"linux_perf_branch", no_argument, NULL, 0x511}, "Use PERF_COUNT_HW_BRANCH_INSTRUCTIONS perf"},
-        {{"linux_perf_bts_block", no_argument, NULL, 0x512}, "Use Intel BTS to count unique blocks"},
         {{"linux_perf_bts_edge", no_argument, NULL, 0x513}, "Use Intel BTS to count unique edges"},
-        {{"linux_perf_ipt_block", no_argument, NULL, 0x514}, "Use Intel Processor Trace to count unique blocks"},
-        {{"linux_perf_custom", no_argument, NULL, 0x520}, "Custom counter (see interceptor/stringmem.c)"},
+        {{"linux_perf_ipt_block", no_argument, NULL, 0x514}, "Use Intel Processor Trace to count unique blocks (requires libipt.so)"},
+        {{"linux_perf_kernel_only", no_argument, NULL, 0x515}, "Gather kernel-only coverage with Intel PT and with Intel BTS"},
+        {{"linux_ns_net", no_argument, NULL, 0x0530}, "Use Linux NET namespace isolation"},
+        {{"linux_ns_pid", no_argument, NULL, 0x0531}, "Use Linux PID namespace isolation"},
+        {{"linux_ns_ipc", no_argument, NULL, 0x0532}, "Use Linux IPC namespace isolation"},
 #endif  // defined(_HF_ARCH_LINUX)
         {{0, 0, 0, 0}, NULL},
     };
@@ -278,7 +329,7 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
     const char *logfile = NULL;
     int opt_index = 0;
     for (;;) {
-        int c = getopt_long(argc, argv, "-?hqvVsuPf:d:e:W:r:c:F:t:R:n:N:l:p:g:E:w:B:C", opts,
+        int c = getopt_long(argc, argv, "-?hQvVsuPf:d:e:W:r:c:F:t:R:n:N:l:p:g:E:w:B:CzTS", opts,
                             &opt_index);
         if (c < 0)
             break;
@@ -289,10 +340,10 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
             cmdlineUsage(argv[0], custom_opts);
             break;
         case 'f':
-            hfuzz->inputFile = optarg;
+            hfuzz->inputDir = optarg;
             break;
-        case 'q':
-            hfuzz->nullifyStdio = true;
+        case 'Q':
+            hfuzz->nullifyStdio = false;
             break;
         case 'v':
             hfuzz->useScreen = false;
@@ -327,6 +378,12 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
         case 'C':
             hfuzz->useSanCov = true;
             break;
+        case 'S':
+            hfuzz->enableSanitizers = true;
+            break;
+        case 'z':
+            hfuzz->dynFileMethod |= _HF_DYNFILE_SOFT;
+            break;
         case 'F':
             hfuzz->maxFileSz = strtoul(optarg, NULL, 0);
             break;
@@ -339,6 +396,14 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
         case 'n':
             hfuzz->threadsMax = atol(optarg);
             break;
+        case 0x109:
+            {
+                time_t p = atol(optarg);
+                if (p > 0) {
+                    hfuzz->runEndTime = time(NULL) + p;
+                }
+            }
+            break;
         case 'N':
             hfuzz->mutationsMax = atol(optarg);
             break;
@@ -348,11 +413,30 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
         case 0x101:
             hfuzz->clearEnv = true;
             break;
-        case 0x102:
-            hfuzz->msanReportUMRS = true;
+        case 0x103:
+            hfuzz->covDir = optarg;
+            break;
+        case 0x104:
+            hfuzz->postExternalCommand = optarg;
+            break;
+        case 0x105:
+            if ((strcasecmp(optarg, "0") == 0) || (strcasecmp(optarg, "false") == 0)) {
+                hfuzz->monitorSIGABRT = false;
+            } else {
+                hfuzz->monitorSIGABRT = true;
+            }
+            break;
+        case 0x106:
+            hfuzz->skipFeedbackOnTimeout = true;
+            break;
+        case 0x107:
+            hfuzz->exitUponCrash = true;
             break;
         case 'P':
             hfuzz->persistent = true;
+            break;
+        case 'T':
+            hfuzz->tmout_vtalrm = true;
             break;
         case 'p':
             if (util_isANumber(optarg) == false) {
@@ -382,6 +466,7 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
         case 'B':
             hfuzz->blacklistFile = optarg;
             break;
+#if defined(_HF_ARCH_LINUX)
         case 0x500:
             hfuzz->linux.ignoreAddr = (void *)strtoul(optarg, NULL, 0);
             break;
@@ -391,14 +476,17 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
         case 0x503:
             hfuzz->linux.dynamicCutOffAddr = strtoull(optarg, NULL, 0);
             break;
+        case 0x504:
+            hfuzz->linux.symsBlFile = optarg;
+            break;
+        case 0x505:
+            hfuzz->linux.symsWlFile = optarg;
+            break;
         case 0x510:
             hfuzz->dynFileMethod |= _HF_DYNFILE_INSTR_COUNT;
             break;
         case 0x511:
             hfuzz->dynFileMethod |= _HF_DYNFILE_BRANCH_COUNT;
-            break;
-        case 0x512:
-            hfuzz->dynFileMethod |= _HF_DYNFILE_BTS_BLOCK;
             break;
         case 0x513:
             hfuzz->dynFileMethod |= _HF_DYNFILE_BTS_EDGE;
@@ -406,9 +494,19 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
         case 0x514:
             hfuzz->dynFileMethod |= _HF_DYNFILE_IPT_BLOCK;
             break;
-        case 0x520:
-            hfuzz->dynFileMethod |= _HF_DYNFILE_CUSTOM;
+        case 0x515:
+            hfuzz->linux.kernelOnly = true;
             break;
+        case 0x530:
+            hfuzz->linux.cloneFlags |= (CLONE_NEWUSER | CLONE_NEWNET);
+            break;
+        case 0x531:
+            hfuzz->linux.cloneFlags |= (CLONE_NEWUSER | CLONE_NEWPID);
+            break;
+        case 0x532:
+            hfuzz->linux.cloneFlags |= (CLONE_NEWUSER | CLONE_NEWIPC);
+            break;
+#endif                          /* defined(_HF_ARCH_LINUX) */
         default:
             cmdlineUsage(argv[0], custom_opts);
             return false;
@@ -433,9 +531,15 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
         return false;
     }
 
-    /* Sanity checks for timeout. Optimal ranges highly depend on target */
-    if (hfuzz->useSanCov && hfuzz->tmOut < 10) {
-        LOG_E("Timeout value (%ld) too small for sanitizer coverage feedback", (long)hfuzz->tmOut);
+    if (hfuzz->fuzzStdin && hfuzz->persistent) {
+        LOG_E
+            ("Stdin fuzzing (-s) and persistent fuzzing (-P) cannot be specified at the same time");
+        return false;
+    }
+
+    if (hfuzz->threadsMax >= _HF_THREAD_MAX) {
+        LOG_E("Too many fuzzing threads specified %zu (>= _HF_THREAD_MAX (%u))", hfuzz->threadsMax,
+              _HF_THREAD_MAX);
         return false;
     }
 
@@ -461,19 +565,33 @@ bool cmdlineParse(int argc, char *argv[], honggfuzz_t * hfuzz)
         LOG_I("Verifier enabled with 0.0 flipRate, activating dry run mode");
     }
 
-    LOG_I("inputFile '%s', nullifyStdio: %s, fuzzStdin: %s, saveUnique: %s, flipRate: %lf, "
-          "externalCommand: '%s', tmOut: %ld, mutationsMax: %zu, threadsMax: %zu, fileExtn '%s', "
-          "memoryLimit: 0x%" PRIx64 "(MiB), fuzzExe: '%s', fuzzedPid: %d",
-          hfuzz->inputFile,
+    /*
+     * 'enableSanitizers' can be auto enabled when 'useSanCov', although it's probably
+     * better to let user know about the features that each flag control.
+     */
+    if (hfuzz->useSanCov == true && hfuzz->enableSanitizers == false) {
+        LOG_E("Sanitizer coverage cannot be used without enabling sanitizers '-S/--sanitizers'");
+        return false;
+    }
+
+    LOG_I("PID: %d, inputDir '%s', nullifyStdio: %s, fuzzStdin: %s, saveUnique: %s, flipRate: %lf, "
+          "externalCommand: '%s', runEndTime: %d tmOut: %ld, mutationsMax: %zu, threadsMax: %zu, fileExtn: '%s', "
+          "memoryLimit: 0x%" PRIx64 "(MiB), fuzzExe: '%s', fuzzedPid: %d, monitorSIGABRT: '%s'",
+          (int)getpid(), hfuzz->inputDir,
           cmdlineYesNo(hfuzz->nullifyStdio), cmdlineYesNo(hfuzz->fuzzStdin),
           cmdlineYesNo(hfuzz->saveUnique), hfuzz->origFlipRate,
-          hfuzz->externalCommand == NULL ? "NULL" : hfuzz->externalCommand, hfuzz->tmOut,
-          hfuzz->mutationsMax, hfuzz->threadsMax, hfuzz->fileExtn,
-          hfuzz->asLimit, hfuzz->cmdline[0], hfuzz->linux.pid);
+          hfuzz->externalCommand == NULL ? "NULL" : hfuzz->externalCommand, (int)hfuzz->runEndTime,
+          hfuzz->tmOut, hfuzz->mutationsMax, hfuzz->threadsMax, hfuzz->fileExtn, hfuzz->asLimit,
+          hfuzz->cmdline[0], hfuzz->linux.pid, cmdlineYesNo(hfuzz->monitorSIGABRT));
 
     snprintf(hfuzz->cmdline_txt, sizeof(hfuzz->cmdline_txt), "%s", hfuzz->cmdline[0]);
     for (size_t i = 1; hfuzz->cmdline[i]; i++) {
         util_ssnprintf(hfuzz->cmdline_txt, sizeof(hfuzz->cmdline_txt), " %s", hfuzz->cmdline[i]);
+        if (strlen(hfuzz->cmdline_txt) == (sizeof(hfuzz->cmdline_txt) - 1)) {
+            hfuzz->cmdline_txt[sizeof(hfuzz->cmdline_txt) - 3] = '.';
+            hfuzz->cmdline_txt[sizeof(hfuzz->cmdline_txt) - 2] = '.';
+            hfuzz->cmdline_txt[sizeof(hfuzz->cmdline_txt) - 1] = '.';
+        }
     }
 
     return true;

@@ -24,6 +24,26 @@
 #ifndef _HF_SUBPROC_H_
 #define _HF_SUBPROC_H_
 
+#include <signal.h>
+#include <sys/wait.h>
+
+/* Missing WIFCONTINUED in Android */
+#ifndef WIFCONTINUED
+#define WIFCONTINUED(x) WEXITSTATUS(0)
+#endif
+
 extern const char *subproc_StatusToStr(int status, char *str, size_t len);
+
+extern bool subproc_PrepareExecv(honggfuzz_t * hfuzz, fuzzer_t * fuzzer, const char *fileName);
+
+extern bool subproc_Run(honggfuzz_t * hfuzz, fuzzer_t * fuzzer);
+
+extern bool subproc_persistentModeRoundDone(honggfuzz_t * hfuzz, fuzzer_t * fuzzer);
+
+extern uint8_t subproc_System(honggfuzz_t * hfuzz, fuzzer_t * fuzzer, const char *const argv[]);
+
+extern void subproc_checkTimeLimit(honggfuzz_t * hfuzz, fuzzer_t * fuzzer);
+
+extern void subproc_checkTermination(honggfuzz_t * hfuzz, fuzzer_t * fuzzer);
 
 #endif

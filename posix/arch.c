@@ -21,9 +21,10 @@
  *
  */
 
-#include "common.h"
-#include "arch.h"
+#include "../libcommon/common.h"
+#include "../arch.h"
 
+#include <poll.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -40,11 +41,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "files.h"
-#include "log.h"
-#include "sancov.h"
-#include "subproc.h"
-#include "util.h"
+#include "../libcommon/files.h"
+#include "../libcommon/log.h"
+#include "../libcommon/util.h"
+#include "../sancov.h"
+#include "../subproc.h"
 
 /*  *INDENT-OFF* */
 struct {
@@ -56,14 +57,23 @@ struct {
 
     [SIGILL].important = true,
     [SIGILL].descr = "SIGILL",
+
     [SIGFPE].important = true,
     [SIGFPE].descr = "SIGFPE",
+
     [SIGSEGV].important = true,
     [SIGSEGV].descr = "SIGSEGV",
+
     [SIGBUS].important = true,
     [SIGBUS].descr = "SIGBUS",
-    [SIGABRT].important = true,
-    [SIGABRT].descr = "SIGABRT"
+
+    /* Is affected from monitorSIGABRT flag */
+    [SIGABRT].important = false,
+    [SIGABRT].descr = "SIGABRT",
+
+    /* Is affected from tmout_vtalrm flag */
+    [SIGVTALRM].important = false,
+    [SIGVTALRM].descr = "SIGVTALRM-TMOUT",
 };
 /*  *INDENT-ON* */
 
@@ -109,7 +119,7 @@ static bool arch_analyzeSignal(honggfuzz_t * hfuzz, int status, fuzzer_t * fuzze
     }
 
     char localtmstr[PATH_MAX];
-    util_getLocalTime("%F.%H:%M:%S", localtmstr, sizeof(localtmstr), time(NULL));
+    util_getLocalTime("%F.%H.%M.%S", localtmstr, sizeof(localtmstr), time(NULL));
 
     char newname[PATH_MAX];
 
@@ -117,9 +127,9 @@ static bool arch_analyzeSignal(honggfuzz_t * hfuzz, int status, fuzzer_t * fuzze
     if (hfuzz->origFlipRate == 0.0L && hfuzz->useVerifier) {
         snprintf(newname, sizeof(newname), "%s", fuzzer->origFileName);
     } else {
-        snprintf(newname, sizeof(newname), "%s/%s.%d.%s.%s.%s",
+        snprintf(newname, sizeof(newname), "%s/%s.PID.%d.TIME.%s.%s",
                  hfuzz->workDir, arch_sigs[termsig].descr, fuzzer->pid, localtmstr,
-                 fuzzer->origFileName, hfuzz->fileExtn);
+                 hfuzz->fileExtn);
     }
 
     LOG_I("Ok, that's interesting, saving the '%s' as '%s'", fuzzer->fileName, newname);
@@ -131,7 +141,7 @@ static bool arch_analyzeSignal(honggfuzz_t * hfuzz, int status, fuzzer_t * fuzze
     ATOMIC_POST_INC(hfuzz->uniqueCrashesCnt);
 
     if (files_writeBufToFile
-        (fuzzer->crashFileName, fuzzer->dynamicFile, fuzzer->dynamicFileSz,
+        (newname, fuzzer->dynamicFile, fuzzer->dynamicFileSz,
          O_CREAT | O_EXCL | O_WRONLY) == false) {
         LOG_E("Couldn't copy '%s' to '%s'", fuzzer->fileName, fuzzer->crashFileName);
     }
@@ -168,33 +178,94 @@ bool arch_launchChild(honggfuzz_t * hfuzz, char *fileName)
 
     LOG_D("Launching '%s' on file '%s'", args[0], fileName);
 
+    /* alarm persists across forks, so disable it here */
+    alarm(0);
     execvp(args[0], args);
+    alarm(1);
+
     return false;
+}
+
+void arch_prepareParent(honggfuzz_t * hfuzz UNUSED, fuzzer_t * fuzzer UNUSED)
+{
+}
+
+void arch_prepareParentAfterFork(honggfuzz_t * hfuzz UNUSED, fuzzer_t * fuzzer UNUSED)
+{
 }
 
 void arch_reapChild(honggfuzz_t * hfuzz, fuzzer_t * fuzzer)
 {
-    int status;
-
     for (;;) {
-#ifndef __WALL
-#define __WALL 0
-#endif
-        while (wait4(fuzzer->pid, &status, __WALL, NULL) != fuzzer->pid) ;
+        if (hfuzz->persistent) {
+            struct pollfd pfd = {
+                .fd = fuzzer->persistentSock,
+                .events = POLLIN,
+            };
+            int r = poll(&pfd, 1, 250 /* 0.25s */ );
+            if (r == 0 || (r == -1 && errno == EINTR)) {
+                subproc_checkTimeLimit(hfuzz, fuzzer);
+                subproc_checkTermination(hfuzz, fuzzer);
+            }
+            if (r == -1 && errno != EINTR) {
+                PLOG_F("poll(fd=%d)", fuzzer->persistentSock);
+            }
+        }
+        if (subproc_persistentModeRoundDone(hfuzz, fuzzer) == true) {
+            break;
+        }
+
+        int status;
+        int flags = hfuzz->persistent ? WNOHANG : 0;
+        int ret = waitpid(fuzzer->pid, &status, flags);
+        if (ret == 0) {
+            continue;
+        }
+        if (ret == -1 && errno == EINTR) {
+            subproc_checkTimeLimit(hfuzz, fuzzer);
+            continue;
+        }
+        if (ret == -1) {
+            PLOG_W("waitpid(pid=%d)", fuzzer->pid);
+            continue;
+        }
+        if (ret != fuzzer->pid) {
+            continue;
+        }
 
         char strStatus[4096];
+        if (hfuzz->persistent && ret == fuzzer->persistentPid
+            && (WIFEXITED(status) || WIFSIGNALED(status))) {
+            fuzzer->persistentPid = 0;
+            if (ATOMIC_GET(hfuzz->terminating) == false) {
+                LOG_W("Persistent mode: PID %d exited with status: %s", ret,
+                      subproc_StatusToStr(status, strStatus, sizeof(strStatus)));
+            }
+        }
+
         LOG_D("Process (pid %d) came back with status: %s", fuzzer->pid,
               subproc_StatusToStr(status, strStatus, sizeof(strStatus)));
 
         if (arch_analyzeSignal(hfuzz, status, fuzzer)) {
-            return;
+            break;
         }
     }
 }
 
-bool arch_archInit(honggfuzz_t * hfuzz UNUSED)
+bool arch_archInit(honggfuzz_t * hfuzz)
 {
+    /* Default is true for all platforms except Android */
+    arch_sigs[SIGABRT].important = hfuzz->monitorSIGABRT;
+
+    /* Default is false */
+    arch_sigs[SIGVTALRM].important = hfuzz->tmout_vtalrm;
+
     return true;
+}
+
+void arch_sigFunc(int sig UNUSED)
+{
+    return;
 }
 
 bool arch_archThreadInit(honggfuzz_t * hfuzz UNUSED, fuzzer_t * fuzzer UNUSED)

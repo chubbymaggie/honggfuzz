@@ -21,7 +21,7 @@
  *
  */
 
-#include "common.h"
+#include "libcommon/common.h"
 #include "report.h"
 
 #include <fcntl.h>
@@ -30,8 +30,8 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#include "log.h"
-#include "util.h"
+#include "libcommon/log.h"
+#include "libcommon/util.h"
 
 static int reportFD = -1;
 
@@ -46,12 +46,10 @@ static void report_printdynFileMethod(honggfuzz_t * hfuzz)
             dprintf(reportFD, "INSTR_COUNT ");
         if (hfuzz->dynFileMethod & _HF_DYNFILE_BRANCH_COUNT)
             dprintf(reportFD, "BRANCH_COUNT ");
-        if (hfuzz->dynFileMethod & _HF_DYNFILE_BTS_BLOCK)
-            dprintf(reportFD, "BLOCK_COUNT ");
         if (hfuzz->dynFileMethod & _HF_DYNFILE_BTS_EDGE)
-            dprintf(reportFD, "EDGE_COUNT ");
-        if (hfuzz->dynFileMethod & _HF_DYNFILE_CUSTOM)
-            dprintf(reportFD, "CUSTOM ");
+            dprintf(reportFD, "BTS_EDGE_COUNT ");
+        if (hfuzz->dynFileMethod & _HF_DYNFILE_IPT_BLOCK)
+            dprintf(reportFD, "IPT_BLOCK_COUNT ");
 
         dprintf(reportFD, "\n");
     }
@@ -69,9 +67,11 @@ static void report_printTargetCmd(honggfuzz_t * hfuzz)
 
 void report_Report(honggfuzz_t * hfuzz, char *s)
 {
-    if (s[0] == '\0') {
+    if (s == NULL || s[0] == '\0') {
         return;
     }
+
+    MX_SCOPED_LOCK(&hfuzz->report_mutex);
 
     if (reportFD == -1) {
         char reportFName[PATH_MAX];

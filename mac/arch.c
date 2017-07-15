@@ -22,8 +22,8 @@
  *
  */
 
-#include "common.h"
-#include "arch.h"
+#include "../libcommon/common.h"
+#include "../arch.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -43,11 +43,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "files.h"
-#include "log.h"
-#include "sancov.h"
-#include "subproc.h"
-#include "util.h"
+#include "../libcommon/files.h"
+#include "../libcommon/log.h"
+#include "../libcommon/util.h"
+#include "../sancov.h"
+#include "../subproc.h"
 
 #include <servers/bootstrap.h>
 #include <mach/mach.h>
@@ -122,8 +122,14 @@ void arch_initSigs(void)
     arch_sigs[SIGSEGV].descr = "SIGSEGV";
     arch_sigs[SIGBUS].important = true;
     arch_sigs[SIGBUS].descr = "SIGBUS";
+
+    /* Is affected from monitorSIGABRT flag */
     arch_sigs[SIGABRT].important = true;
     arch_sigs[SIGABRT].descr = "SIGABRT";
+
+    /* Is affected from tmout_vtalrm flag */
+    arch_sigs[SIGVTALRM].important = false;
+    arch_sigs[SIGVTALRM].descr = "SIGVTALRM";
 }
 
 const char *exception_to_string(int exception)
@@ -358,22 +364,20 @@ bool arch_launchChild(honggfuzz_t * hfuzz, char *fileName)
         return false;
     }
 
+    /* alarm persists across forks, so disable it here */
+    alarm(0);
     execvp(args[0], args);
+    alarm(1);
+
     return false;
 }
 
-static void arch_checkTimeLimit(honggfuzz_t * hfuzz, fuzzer_t * fuzzer)
+void arch_prepareParent(honggfuzz_t * hfuzz UNUSED, fuzzer_t * fuzzer UNUSED)
 {
-    if (!hfuzz->tmOut) {
-        return;
-    }
-    int64_t curMillis = util_timeNowMillis();
-    int64_t diffMillis = curMillis - fuzzer->timeStartedMillis;
-    if (diffMillis > ((hfuzz->tmOut + 2) * 1000)) {
-        LOG_W("PID %d took too much time (limit %ld s). Sending SIGKILL",
-              fuzzer->pid, hfuzz->tmOut);
-        kill(fuzzer->pid, SIGKILL);
-    }
+}
+
+void arch_prepareParentAfterFork(honggfuzz_t * hfuzz UNUSED, fuzzer_t * fuzzer UNUSED)
+{
 }
 
 void arch_reapChild(honggfuzz_t * hfuzz, fuzzer_t * fuzzer)
@@ -381,7 +385,7 @@ void arch_reapChild(honggfuzz_t * hfuzz, fuzzer_t * fuzzer)
     /*
      * First check manually if we have expired children
      */
-    arch_checkTimeLimit(hfuzz, fuzzer);
+    subproc_checkTimeLimit(hfuzz, fuzzer);
 
     /*
      * Now check for signals using wait4
@@ -395,7 +399,7 @@ void arch_reapChild(honggfuzz_t * hfuzz, fuzzer_t * fuzzer)
         int status = 0;
         while (wait4(fuzzer->pid, &status, options, NULL) != fuzzer->pid) {
             if (hfuzz->tmOut) {
-                arch_checkTimeLimit(hfuzz, fuzzer);
+                subproc_checkTimeLimit(hfuzz, fuzzer);
                 usleep(0.20 * 1000000);
             }
         }
@@ -480,6 +484,12 @@ bool arch_archInit(honggfuzz_t * hfuzz)
         LOG_F("Parent: could not detach thread to wait for child's exception");
         return false;
     }
+
+    /* Default is true for all platforms except Android */
+    arch_sigs[SIGABRT].important = hfuzz->monitorSIGABRT;
+
+    /* Default is false */
+    arch_sigs[SIGVTALRM].important = hfuzz->tmout_vtalrm;
 
     return true;
 }

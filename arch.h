@@ -24,7 +24,7 @@
 #ifndef _HF_ARCH_H_
 #define _HF_ARCH_H_
 
-#include "common.h"
+#include "libcommon/common.h"
 
 extern bool arch_launchChild(honggfuzz_t * fuzz, char *fileName);
 
@@ -35,5 +35,9 @@ extern bool arch_archThreadInit(honggfuzz_t * fuzz, fuzzer_t * fuzzer);
 extern pid_t arch_fork(honggfuzz_t * fuzz, fuzzer_t * fuzzer);
 
 extern void arch_reapChild(honggfuzz_t * fuzz, fuzzer_t * fuzzer);
+
+extern void arch_prepareParent(honggfuzz_t * fuzz, fuzzer_t * fuzzer);
+
+extern void arch_prepareParentAfterFork(honggfuzz_t * fuzz, fuzzer_t * fuzzer);
 
 #endif                          /* _HF_ARCH_H_ */

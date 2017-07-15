@@ -15,8 +15,6 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-readonly ANDROID_API="android-23"
-
 if [ -z "$NDK" ]; then
   # Search in $PATH
   if [[ $(which ndk-build) != "" ]]; then
@@ -27,6 +25,14 @@ if [ -z "$NDK" ]; then
   fi
 fi
 
+if [ -z "$ANDROID_API" ]; then
+  ANDROID_API="android-23"
+fi
+if ! echo "$ANDROID_API" | grep -qoE 'android-[0-9]{1,2}'; then
+  echo "[-] Invalid ANDROID_API '$ANDROID_API'"
+  exit 1
+fi
+
 if [ $# -ne 2 ]; then
   echo "[-] Invalid arguments"
   echo "[!] $0 <libBlocksRuntime_DIR> <ARCH>"
@@ -34,7 +40,7 @@ if [ $# -ne 2 ]; then
   exit 1
 fi
 
-readonly BRT_DIR=$1
+readonly BRT_DIR="$1"
 
 case "$2" in
   arm|arm64|x86|x86_64)
@@ -47,22 +53,34 @@ case "$2" in
     ;;
 esac
 
+# Check if previous build exists and matches selected ANDROID_API level
+# If API cache file not there always rebuild
+if [ -f "$BRT_DIR/$ARCH/libblocksruntime.a" ]; then
+  if [ -f "$BRT_DIR/$ARCH/android_api.txt" ]; then
+    old_api=$(cat "$BRT_DIR/$ARCH/android_api.txt")
+    if [[ "$old_api" == "$ANDROID_API" ]]; then
+      # No need to recompile
+      exit 0
+    fi
+  fi
+fi
+
 case "$ARCH" in
   arm)
     BRT_ARCH="armeabi-v7a"
-    BRT_TOOLCHAIN="arm-linux-androideabi-clang3.6"
+    BRT_TOOLCHAIN="arm-linux-androideabi-clang"
     ;;
   arm64)
     BRT_ARCH="arm64-v8a"
-    BRT_TOOLCHAIN="aarch64-linux-android-clang3.6"
+    BRT_TOOLCHAIN="aarch64-linux-android-clang"
     ;;
   x86)
     BRT_ARCH="x86"
-    BRT_TOOLCHAIN="x86-clang3.6"
+    BRT_TOOLCHAIN="x86-clang"
     ;;
   x86_64)
     BRT_ARCH="x86_64"
-    BRT_TOOLCHAIN="x86_64-clang3.6"
+    BRT_TOOLCHAIN="x86_64-clang"
     ;;
 esac
 
@@ -85,7 +103,8 @@ fi
 # Change workdir to simplify args
 cd $BRT_DIR
 
-cp obj/local/$BRT_ARCH/libblocksruntime.a $ARCH/
+cp obj/local/$BRT_ARCH/libblocksruntime.a "$ARCH/"
+echo "$ANDROID_API" > "$ARCH/android_api.txt"
 
 # Revert workdir to caller
 cd - &>/dev/null
